@@ -12,20 +12,16 @@ COPY main.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/tender-monitor .
 
 # ---- Runtime stage ----
-FROM alpine:3.20
-
-RUN apk add --no-cache ca-certificates curl tzdata \
-    && adduser -D -u 10001 app
-
-ENV TZ=Europe/Moscow
+# distroless: ca-certificates и tzdata уже внутри — apk не нужен
+# (на сервере Dokploy dl-cdn.alpinelinux.org заблокирован, apk add падает)
+FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
 COPY --from=build /out/tender-monitor /app/tender-monitor
 
-USER app
 EXPOSE 8787
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:8787/ || exit 1
+# Планировщик запускается в 08:00 МСК
+ENV TZ=Europe/Moscow
 
 ENTRYPOINT ["/app/tender-monitor"]
