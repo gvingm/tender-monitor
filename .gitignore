@@ -12,5 +12,7 @@ pkg/
 .DS_Store
 *.zip
 !tender-monitor-deploy-*.zip
+*.exe
+*.log
 # Legacy Python entry point — заменён на main.go
 main.py
