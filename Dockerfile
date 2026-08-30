@@ -14,8 +14,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/tender-monitor .
 # ---- Runtime stage ----
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates curl \
+RUN apk add --no-cache ca-certificates curl tzdata \
     && adduser -D -u 10001 app
+
+ENV TZ=Europe/Moscow
 
 WORKDIR /app
 COPY --from=build /out/tender-monitor /app/tender-monitor
