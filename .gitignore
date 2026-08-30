@@ -16,3 +16,6 @@ pkg/
 *.log
 # Legacy Python entry point — заменён на main.go
 main.py
+ddasd
+*_test.json
+_research/

@@ -1,4 +1,5 @@
-// Package main — Tender Monitor: ежедневный мониторинг тендеров Tenderplan + Lark Bitable + Kimi-резюме.
+// Package main — Tender Monitor: мониторинг тендеров Tenderplan + Lark Bitable + Kimi-резюме
+// + скачивание файлов тендера при переходе карточки в статус «На рассмотрении».
 //
 // Go-порт исходного Python FastAPI-приложения (см. git history).
 // Один файл, stdlib only.
@@ -14,7 +15,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -25,42 +28,72 @@ import (
 // ===== CONFIG =====
 
 const (
-	tenderplanAPI   = "https://tenderplan.ru/api"
-	kimiAPI         = "https://api.moonshot.ai/v1/chat/completions"
-	kimiModel       = "kimi-k2.6"
-	larkBase        = "https://open.larksuite.com/open-apis"
-	listenAddr      = ":8787"
-	dailyRunHour    = 8
-	dailyRunMinute  = 0
-	defaultAppID    = "cli_aa1810fe6f78c079"
-	defaultBitableApp = "X37KbBltZaqSSdsGyJdumNLFtmh"
+	tenderplanAPI       = "https://tenderplan.ru/api"
+	kimiAPI             = "https://api.moonshot.ai/v1/chat/completions"
+	kimiModel           = "kimi-k2.6"
+	larkBase            = "https://open.larksuite.com/open-apis"
+	listenAddr          = ":8787"
+	dailyRunHour        = 8
+	dailyRunMinute      = 0
+	filesPollInterval   = 5 * time.Minute // периодический опрос карточек «На рассмотрении»
+	fileDownloadTimeout = 60 * time.Second // таймаут на скачивание одного файла
+	maxListPages        = 3                // максимум страниц getlist на кластер (защита от лимитов)
+	tpRequestPause      = 250 * time.Millisecond
+	tokenTTL            = 2 * time.Hour
+
+	defaultAppID        = "cli_aa1810fe6f78c079"
+	defaultBitableApp   = "X37KbBltZaqSSdsGyJdumNLFtmh"
 	defaultBitableTable = "tblalXw0gAIi3pVc"
-	defaultChatID   = "oc_6cc3a4c2e69b74e6a7d240c1e95db951"
-	tokenTTL        = 2 * time.Hour
+	defaultChatID       = "oc_6cc3a4c2e69b74e6a7d240c1e95db951"
 )
 
 var (
-	tenderplanKey = os.Getenv("TENDERPLAN_KEY")
-	kimiKey       = os.Getenv("KIMI_KEY")
+	// Поддерживаем и старые mixed-case имена переменных (fallback).
+	tenderplanKey = envOrMulti("", "TENDERPLAN_KEY", "Tenderplan_API_Key")
+	kimiKey       = envOrMulti("", "KIMI_KEY", "Kimi_API_Key")
 	mailSecret    = os.Getenv("MAIL_SECRET")
-	larkAppID     = envOr("LARK_APP_ID", defaultAppID)
-	larkAppSecret = os.Getenv("LARK_APP_SECRET")
-	bitableApp    = envOr("LARK_BITABLE_APP", defaultBitableApp)
-	bitableTable  = envOr("LARK_BITABLE_TABLE", defaultBitableTable)
-	chatID        = envOr("LARK_CHAT_ID", defaultChatID)
+	larkAppID     = envOrMulti(defaultAppID, "LARK_APP_ID", "Lark_App_ID")
+	larkAppSecret = envOrMulti("", "LARK_APP_SECRET", "Lark_App_Secret")
+	bitableApp    = envOrMulti(defaultBitableApp, "LARK_BITABLE_APP", "Lark_Bitable_App")
+	bitableTable  = envOrMulti(defaultBitableTable, "LARK_BITABLE_TABLE", "Lark_Bitable_Table")
+	chatID        = envOrMulti(defaultChatID, "LARK_CHAT_ID", "Lark_Chat_ID")
 )
 
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
+func envOrMulti(def string, keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
 	}
 	return def
 }
 
 var clusters = map[string][]string{
-	"Росморпорт":   {"Росморпорт", "морской порт", "акватория", "дноуглубление", "берегоукрепление", "гидротехника", "причал"},
+	"Росморпорт":    {"Росморпорт", "морской порт", "акватория", "дноуглубление", "берегоукрепление", "гидротехника", "причал"},
 	"Малый техфлот": {"земснаряд", "буксир", "шаланда", "понтон", "катер", "моторная яхта", "маломерное судно"},
-	"Иное":         {"дноуглубление", "дноуглубительные работы", "судостроение", "гидротехника", "аренда флота"},
+	"Иное":          {"дноуглубление", "дноуглубительные работы", "судостроение", "гидротехника", "аренда флота"},
+}
+
+// ===== HTTP CLIENTS =====
+// Один общий клиент с keep-alive для всех API; файлы — отдельный клиент без
+// общего таймаута (таймаут задаётся контекстом на каждый файл).
+
+var apiClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        20,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+var fileClient = &http.Client{
+	// без общего Timeout: ограничение 60с ставим через context на каждый файл
+	Transport: &http.Transport{
+		MaxIdleConns:        20,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     60 * time.Second,
+	},
 }
 
 // ===== LARK AUTH =====
@@ -86,7 +119,7 @@ func getTenantToken(ctx context.Context) (string, error) {
 		larkBase+"/auth/v3/tenant_access_token/internal",
 		bytes.NewBufferString(fmt.Sprintf(`{"app_id":"%s","app_secret":"%s"}`, larkAppID, larkAppSecret)))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -98,6 +131,9 @@ func getTenantToken(ctx context.Context) (string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
 	}
+	if out.TenantAccessToken == "" {
+		return "", fmt.Errorf("lark: пустой tenant_access_token")
+	}
 	tkCache.mu.Lock()
 	tkCache.value = out.TenantAccessToken
 	tkCache.exp = time.Now().Add(tokenTTL)
@@ -107,43 +143,161 @@ func getTenantToken(ctx context.Context) (string, error) {
 
 // ===== TENDERPLAN =====
 
+// Tender — внутренняя модель тендера (и формат входа webhook mail-tenders).
 type Tender struct {
+	ID          string  `json:"id"` // TenderplanID (_id)
 	Number      string  `json:"number"`
 	Name        string  `json:"name"`
 	Customer    string  `json:"customer"`
 	Region      string  `json:"region"`
 	Amount      float64 `json:"amount"`
-	Deadline    string  `json:"deadline"`
+	Deadline    string  `json:"deadline"` // RFC3339
 	URL         string  `json:"url"`
 	Title       string  `json:"title"`
 	Description string  `json:"description"`
 }
 
-func fetchTenders(ctx context.Context, clusterName string, keywords []string, since string) ([]Tender, error) {
-	q := strings.Join(keywords, " OR ")
-	u := tenderplanAPI + "/tenders/getlist?key=" + tenderplanKey + "&q=" + urlQueryEscape(q)
-	if since != "" {
-		u += "&since=" + urlQueryEscape(since)
-	}
-	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var out struct {
-		Data []Tender `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	return out.Data, nil
+// Короткая модель из /api/tenders/v2/getlist.
+type tpShortTender struct {
+	ID                      string          `json:"_id"`
+	Number                  string          `json:"number"`
+	OrderName               string          `json:"orderName"`
+	MaxPrice                *float64        `json:"maxPrice"`
+	Currency                string          `json:"currency"`
+	Region                  json.RawMessage `json:"region"` // числовой код (напр. 39), на всякий случай RawMessage
+	PublicationDateTime     int64           `json:"publicationDateTime"`
+	SubmissionCloseDateTime int64           `json:"submissionCloseDateTime"`
+	PlacingWay              int             `json:"placingWay"`
+	Kind                    int             `json:"kind"`
+	Status                  int             `json:"status"`
+	Customers               []struct {
+		GUID   string `json:"guid"`
+		Name   string `json:"name"`
+		Region int    `json:"region"`
+	} `json:"customers"`
+	Href string `json:"href"` // в короткой модели обычно отсутствует
 }
 
-func urlQueryEscape(s string) string {
-	// минимальный escape для совместимости с Python OR
-	r := strings.NewReplacer(" ", "%20", "/", "%2F", "?", "%3F", "&", "%26", "=", "%3D", "#", "%23")
-	return r.Replace(s)
+type tpListResponse struct {
+	// "tender" — полная модель первого тендера выборки (можно взять href без лишнего запроса).
+	Tender  *struct {
+		ID   string `json:"_id"`
+		Href string `json:"href"`
+	} `json:"tender"`
+	Tenders []tpShortTender `json:"tenders"`
+}
+
+// rawToString конвертирует RawMessage (число или строка) в строку.
+func rawToString(r json.RawMessage) string {
+	s := strings.TrimSpace(string(r))
+	if s == "" || s == "null" {
+		return ""
+	}
+	s = strings.Trim(s, `"`)
+	if f, err := strconv.ParseFloat(s, 64); err == nil && f == float64(int64(f)) {
+		return strconv.FormatInt(int64(f), 10)
+	}
+	return s
+}
+
+// tpGet выполняет GET к tenderplan API с Bearer-авторизацией и паузой после запроса (лимиты).
+func tpGet(ctx context.Context, u string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tenderplanKey)
+	resp, err := apiClient.Do(req)
+	time.Sleep(tpRequestPause)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("tenderplan HTTP %d: %.200s", resp.StatusCode, string(body))
+	}
+	return json.Unmarshal(body, out)
+}
+
+// fetchTenders — выборка тендеров кластера через v2/getlist с пагинацией (page=0,1,2...).
+// since (RFC3339, опционально) маппится в fromPublicationDateTime (мс).
+func fetchTenders(ctx context.Context, clusterName string, keywords []string, since string) ([]Tender, error) {
+	q := strings.Join(keywords, " OR ")
+	var all []Tender
+	for page := 0; page < maxListPages; page++ {
+		u := fmt.Sprintf("%s/tenders/v2/getlist?q=%s&page=%d",
+			tenderplanAPI, url.QueryEscape(q), page)
+		if since != "" {
+			if ts, err := time.Parse(time.RFC3339, since); err == nil {
+				u += "&fromPublicationDateTime=" + strconv.FormatInt(ts.UnixMilli(), 10)
+			}
+		}
+		var out tpListResponse
+		if err := tpGet(ctx, u, &out); err != nil {
+			return all, fmt.Errorf("%s page=%d: %w", clusterName, page, err)
+		}
+		if len(out.Tenders) == 0 {
+			break
+		}
+		for i, st := range out.Tenders {
+			t := Tender{
+				ID:       st.ID,
+				Number:   st.Number,
+				Name:     st.OrderName,
+				Region:   rawToString(st.Region),
+				Title:    st.OrderName,
+				Deadline: msToRFC3339(st.SubmissionCloseDateTime),
+			}
+			if st.MaxPrice != nil {
+				t.Amount = *st.MaxPrice
+			}
+			if len(st.Customers) > 0 {
+				t.Customer = st.Customers[0].Name
+				if t.Region == "" {
+					t.Region = strconv.Itoa(st.Customers[0].Region)
+				}
+			}
+			// href: из короткой модели, либо из полной модели первого элемента выборки.
+			t.URL = st.Href
+			if t.URL == "" && page == 0 && i == 0 && out.Tender != nil && out.Tender.ID == st.ID {
+				t.URL = out.Tender.Href
+			}
+			all = append(all, t)
+		}
+	}
+	return all, nil
+}
+
+// fetchTenderHref догружает полную модель тендера ради ссылки на площадку-источник.
+func fetchTenderHref(ctx context.Context, id string) (string, error) {
+	var out struct {
+		Href string `json:"href"`
+		// некоторые версии API заворачивают модель
+		Tender *struct {
+			Href string `json:"href"`
+		} `json:"tender"`
+	}
+	if err := tpGet(ctx, tenderplanAPI+"/tenders/get?id="+url.QueryEscape(id), &out); err != nil {
+		return "", err
+	}
+	if out.Href != "" {
+		return out.Href, nil
+	}
+	if out.Tender != nil {
+		return out.Tender.Href, nil
+	}
+	return "", nil
+}
+
+func msToRFC3339(ms int64) string {
+	if ms <= 0 {
+		return ""
+	}
+	return time.UnixMilli(ms).Format(time.RFC3339)
 }
 
 // ===== KIMI =====
@@ -168,15 +322,17 @@ func kimiSummarize(ctx context.Context, t Tender) (string, error) {
 Рекомендация: [подавать/не подавать]`,
 		t.Name, t.Customer, t.Description, formatAmount(t.Amount), t.Region, t.Deadline)
 
+	// ВАЖНО: max_tokens >= 512 — иначе из-за reasoning-модели ответ приходит пустым.
 	body, _ := json.Marshal(map[string]any{
 		"model":       kimiModel,
 		"messages":    []map[string]string{{"role": "user", "content": prompt}},
 		"temperature": 0.3,
+		"max_tokens":  1024,
 	})
 	req, _ := http.NewRequestWithContext(ctx, "POST", kimiAPI, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+kimiKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -191,7 +347,7 @@ func kimiSummarize(ctx context.Context, t Tender) (string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
 	}
-	if len(out.Choices) == 0 {
+	if len(out.Choices) == 0 || out.Choices[0].Message.Content == "" {
 		return "", fmt.Errorf("kimi: empty response")
 	}
 	return out.Choices[0].Message.Content, nil
@@ -209,12 +365,140 @@ type bitableResult struct {
 	Code   int    `json:"code"`
 }
 
-func addToBitable(ctx context.Context, t Tender, cluster, summary string) (bitableResult, error) {
+// bitableRecord — запись из records/search.
+type bitableRecord struct {
+	RecordID string         `json:"record_id"`
+	Fields   map[string]any `json:"fields"`
+}
+
+type larkError struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+}
+
+func (e *larkError) Error() string { return fmt.Sprintf("lark code=%d: %s", e.Code, e.Msg) }
+
+// isFieldNotFound определяет ошибку «поле не существует» в ответе Lark Bitable.
+func isFieldNotFound(code int, msg string) bool {
+	switch code {
+	case 1254043, 1254045, 1254607: // FieldNameNotFound и смежные коды Bitable
+		return true
+	}
+	m := strings.ToLower(msg)
+	if strings.Contains(msg, "FieldNameNotFound") {
+		return true
+	}
+	return strings.Contains(m, "field") &&
+		(strings.Contains(m, "not found") || strings.Contains(m, "not exist") ||
+			strings.Contains(m, "не найден") || strings.Contains(m, "не существует"))
+}
+
+// larkJSON — POST/PUT к Lark Open API с tenant token; возвращает тело ответа.
+func larkJSON(ctx context.Context, method, u string, payload any) ([]byte, error) {
 	token, err := getTenantToken(ctx)
 	if err != nil {
-		return bitableResult{}, err
+		return nil, err
 	}
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
 
+// bitableSearch ищет записи с фильтром (conjunction/conditions), с пагинацией.
+// Возвращает записи или *larkError.
+func bitableSearch(ctx context.Context, conditions []map[string]any, fieldNames []string) ([]bitableRecord, error) {
+	u := fmt.Sprintf("%s/bitable/v1/apps/%s/tables/%s/records/search", larkBase, bitableApp, bitableTable)
+	var records []bitableRecord
+	pageToken := ""
+	for pages := 0; pages < 5; pages++ { // cap: 5 страниц × 100 записей
+		payload := map[string]any{
+			"page_size": 100,
+			"filter": map[string]any{
+				"conjunction": "and",
+				"conditions":  conditions,
+			},
+		}
+		if len(fieldNames) > 0 {
+			payload["field_names"] = fieldNames
+		}
+		if pageToken != "" {
+			payload["page_token"] = pageToken
+		}
+		body, err := larkJSON(ctx, "POST", u, payload)
+		if err != nil {
+			return nil, err
+		}
+		var out struct {
+			Code int    `json:"code"`
+			Msg  string `json:"msg"`
+			Data struct {
+				HasMore   bool            `json:"has_more"`
+				PageToken string          `json:"page_token"`
+				Items     []bitableRecord `json:"items"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			return nil, err
+		}
+		if out.Code != 0 {
+			return nil, &larkError{Code: out.Code, Msg: out.Msg}
+		}
+		records = append(records, out.Data.Items...)
+		if !out.Data.HasMore {
+			break
+		}
+		pageToken = out.Data.PageToken
+	}
+	return records, nil
+}
+
+// findRecordByNumber — проверка дубля по полю «Номер».
+func findRecordByNumber(ctx context.Context, number string) (bool, error) {
+	recs, err := bitableSearch(ctx, []map[string]any{
+		{"field_name": "Номер", "operator": "is", "value": []string{number}},
+	}, nil)
+	if err != nil {
+		return false, err
+	}
+	return len(recs) > 0, nil
+}
+
+// ensureBitableField создаёт поле в таблице (Text/Attachment/Checkbox).
+// Ошибки (в т.ч. «поле уже существует») логируются, но не считаются фатальными.
+func ensureBitableField(ctx context.Context, fieldName, uiType string) error {
+	u := fmt.Sprintf("%s/bitable/v1/apps/%s/tables/%s/fields", larkBase, bitableApp, bitableTable)
+	body, err := larkJSON(ctx, "POST", u, map[string]any{
+		"field_name": fieldName,
+		"ui_type":    uiType,
+	})
+	if err != nil {
+		log.Printf("[bitable] create field %q (%s): %v", fieldName, uiType, err)
+		return err
+	}
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	_ = json.Unmarshal(body, &out)
+	if out.Code != 0 {
+		log.Printf("[bitable] create field %q (%s): code=%d %s", fieldName, uiType, out.Code, out.Msg)
+		return &larkError{Code: out.Code, Msg: out.Msg}
+	}
+	log.Printf("[bitable] поле %q (%s) создано", fieldName, uiType)
+	return nil
+}
+
+// addToBitable: проверка дублей + создание записи. Поле «Заказчик» = кластер (как раньше).
+// TenderplanID пишется для последующего скачивания файлов; при ошибке «поле не существует»
+// поле создаётся, а если и это не удалось — запись создаётся без него.
+func addToBitable(ctx context.Context, t Tender, cluster, summary string) (bitableResult, error) {
 	deadline := any(nil)
 	if t.Deadline != "" {
 		if ts, err := time.Parse(time.RFC3339, t.Deadline); err == nil {
@@ -231,47 +515,87 @@ func addToBitable(ctx context.Context, t Tender, cluster, summary string) (bitab
 		"Ссылка":      map[string]string{"text": t.URL, "link": t.URL},
 		"Kimi резюме": summary,
 	}
+	if t.ID != "" {
+		fields["TenderplanID"] = t.ID
+	}
 
 	// duplicate check
-	dupURL := fmt.Sprintf("%s/bitable/v1/apps/%s/tables/%s/records/search",
-		larkBase, bitableApp, bitableTable)
-	dupBody, _ := json.Marshal(map[string]any{
-		"filter": map[string]any{"and": []any{map[string]any{"field_name": "Номер", "operator": "is", "value": []string{t.Number}}}},
-	})
-	dupReq, _ := http.NewRequestWithContext(ctx, "POST", dupURL, bytes.NewReader(dupBody))
-	dupReq.Header.Set("Authorization", "Bearer "+token)
-	dupReq.Header.Set("Content-Type", "application/json")
-	dupResp, err := http.DefaultClient.Do(dupReq)
+	dup, err := findRecordByNumber(ctx, t.Number)
 	if err != nil {
 		return bitableResult{}, err
 	}
-	defer dupResp.Body.Close()
-	var dupOut struct {
-		Data struct {
-			Items []json.RawMessage `json:"items"`
-		} `json:"data"`
-	}
-	_ = json.NewDecoder(dupResp.Body).Decode(&dupOut)
-	if len(dupOut.Data.Items) > 0 {
-		return bitableResult{Status: "duplicate", Record: dupOut.Data.Items[0]}, nil
+	if dup {
+		return bitableResult{Status: "duplicate"}, nil
 	}
 
-	// create
-	createURL := fmt.Sprintf("%s/bitable/v1/apps/%s/tables/%s/records",
-		larkBase, bitableApp, bitableTable)
-	createBody, _ := json.Marshal(map[string]any{"fields": fields})
-	createReq, _ := http.NewRequestWithContext(ctx, "POST", createURL, bytes.NewReader(createBody))
-	createReq.Header.Set("Authorization", "Bearer "+token)
-	createReq.Header.Set("Content-Type", "application/json")
-	createResp, err := http.DefaultClient.Do(createReq)
+	// create (с одной попыткой самолечения при отсутствии поля)
+	code, rec, err := createBitableRecord(ctx, fields)
+	if err != nil {
+		var le *larkError
+		if ok := asLarkError(err, &le); ok && isFieldNotFound(le.Code, le.Msg) {
+			log.Printf("[bitable] поле не найдено (%s), пробуем создать и повторить", le.Msg)
+			_ = ensureBitableField(ctx, "TenderplanID", "Text")
+			code, rec, err = createBitableRecord(ctx, fields)
+			if err != nil {
+				// не падаем: повторяем без спорного поля
+				if ok := asLarkError(err, &le); ok && isFieldNotFound(le.Code, le.Msg) {
+					delete(fields, "TenderplanID")
+					code, rec, err = createBitableRecord(ctx, fields)
+				}
+			}
+		}
+	}
 	if err != nil {
 		return bitableResult{}, err
 	}
-	defer createResp.Body.Close()
-	body, _ := io.ReadAll(createResp.Body)
-	var result map[string]any
-	_ = json.Unmarshal(body, &result)
-	return bitableResult{Code: createResp.StatusCode, Record: result}, nil
+	return bitableResult{Code: code, Record: rec}, nil
+}
+
+func asLarkError(err error, out **larkError) bool {
+	if le, ok := err.(*larkError); ok {
+		*out = le
+		return true
+	}
+	return false
+}
+
+func createBitableRecord(ctx context.Context, fields map[string]any) (int, any, error) {
+	u := fmt.Sprintf("%s/bitable/v1/apps/%s/tables/%s/records", larkBase, bitableApp, bitableTable)
+	body, err := larkJSON(ctx, "POST", u, map[string]any{"fields": fields})
+	if err != nil {
+		return 0, nil, err
+	}
+	var out map[string]any
+	_ = json.Unmarshal(body, &out)
+	code := 0
+	if c, ok := out["code"].(float64); ok {
+		code = int(c)
+	}
+	if code != 0 {
+		msg, _ := out["msg"].(string)
+		return code, out, &larkError{Code: code, Msg: msg}
+	}
+	return code, out, nil
+}
+
+// bitableText достаёт строку из текстового поля Bitable
+// (в search текст приходит либо строкой, либо массивом сегментов [{text,type}]).
+func bitableText(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []any:
+		var sb strings.Builder
+		for _, seg := range t {
+			if m, ok := seg.(map[string]any); ok {
+				if s, ok := m["text"].(string); ok {
+					sb.WriteString(s)
+				}
+			}
+		}
+		return sb.String()
+	}
+	return ""
 }
 
 // ===== LARK NOTIFICATION =====
@@ -289,11 +613,11 @@ func notifyLark(ctx context.Context, t Tender, cluster, summary string) error {
 		"msg_type":   "text",
 		"content":    string(content),
 	})
-	url := larkBase + "/im/v1/messages?receive_id_type=chat_id"
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	u := larkBase + "/im/v1/messages?receive_id_type=chat_id"
+	req, _ := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -333,6 +657,25 @@ func processTenders(ctx context.Context) runResults {
 			continue
 		}
 		for _, t := range tenders {
+			// дешёвая пред-проверка дубля до дорогих вызовов (полная модель, Kimi)
+			dup, err := findRecordByNumber(ctx, t.Number)
+			if err != nil {
+				res.Errors = append(res.Errors, t.Number+": dupcheck "+err.Error())
+				continue
+			}
+			if dup {
+				res.Processed++
+				res.Duplicates++
+				continue
+			}
+			// ссылку на площадку-источник берём из полной модели, если её нет в короткой
+			if t.URL == "" && t.ID != "" {
+				if href, err := fetchTenderHref(ctx, t.ID); err == nil {
+					t.URL = href
+				} else {
+					log.Printf("[tenderplan] href %s: %v", t.ID, err)
+				}
+			}
 			summary, err := kimiSummarize(ctx, t)
 			if err != nil {
 				res.Errors = append(res.Errors, t.Number+": kimi "+err.Error())
@@ -384,6 +727,396 @@ func processMailTenders(ctx context.Context, tenders []Tender) runResults {
 	return res
 }
 
+// ===== FILE DOWNLOAD PIPELINE =====
+// Скачивание файлов тендера в карточку Bitable при переводе её в статус «На рассмотрении».
+
+// tpAttachment — элемент ответа GET /api/tenders/attachments?id=<_id>.
+type tpAttachment struct {
+	DisplayName         string `json:"displayName"`
+	Href                string `json:"href"` // прямая ссылка на файл на площадке-источнике
+	RealName            string `json:"realName"`
+	Size                int64  `json:"size"`
+	PublicationDateTime int64  `json:"publicationDateTime"`
+}
+
+type fileRunResult struct {
+	StartedAt       string   `json:"started_at"`
+	FinishedAt      string   `json:"finished_at"`
+	RecordsFound    int      `json:"records_found"`
+	RecordsDone     int      `json:"records_done"`
+	FilesDownloaded int      `json:"files_downloaded"`
+	FilesUploaded   int      `json:"files_uploaded"`
+	FilesFailed     int      `json:"files_failed"`
+	Errors          []string `json:"errors,omitempty"`
+}
+
+var filesRunMu sync.Mutex // защита от параллельных запусков файлового пайплайна
+
+// fetchAttachments — список файлов тендера по TenderplanID.
+func fetchAttachments(ctx context.Context, tenderID string) ([]tpAttachment, error) {
+	u := tenderplanAPI + "/tenders/attachments?id=" + url.QueryEscape(tenderID)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tenderplanKey)
+	resp, err := apiClient.Do(req)
+	time.Sleep(tpRequestPause)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("attachments HTTP %d: %.200s", resp.StatusCode, string(body))
+	}
+	// ответ — массив; на всякий случай поддерживаем обёртки {"data":[...]} / {"attachments":[...]}
+	var arr []tpAttachment
+	if err := json.Unmarshal(body, &arr); err == nil {
+		return arr, nil
+	}
+	var wrap map[string]json.RawMessage
+	if err := json.Unmarshal(body, &wrap); err != nil {
+		return nil, err
+	}
+	for _, k := range []string{"data", "attachments", "items"} {
+		if raw, ok := wrap[k]; ok {
+			if err := json.Unmarshal(raw, &arr); err == nil {
+				return arr, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("attachments: неизвестный формат ответа: %.200s", string(body))
+}
+
+// sanitizeFileName чистит имя файла от недопустимых символов (Windows-safe).
+func sanitizeFileName(name string) string {
+	name = strings.TrimSpace(name)
+	repl := strings.NewReplacer(
+		"<", "_", ">", "_", ":", "_", `"`, "_", "/", "_", `\`, "_", "|", "_", "?", "_", "*", "_",
+	)
+	name = repl.Replace(name)
+	name = strings.Map(func(r rune) rune {
+		if r < 32 {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.Trim(name, " .")
+	if name == "" {
+		name = "file"
+	}
+	if len([]rune(name)) > 120 {
+		r := []rune(name)
+		ext := ""
+		if i := strings.LastIndex(name, "."); i > 0 && len(name)-i <= 10 {
+			ext = name[i:]
+		}
+		name = string(r[:120-len([]rune(ext))]) + ext
+	}
+	return name
+}
+
+// downloadAttachment скачивает файл потоково во временный файл в os.TempDir().
+// Прямая ссылка; при 401/403/404 — запасной прокси /api/tenders/file?href= (deprecated, но работает).
+// Возвращает путь к временному файлу (вызывающий обязан удалить) и размер.
+func downloadAttachment(ctx context.Context, att tpAttachment) (string, int64, error) {
+	status, path, size, err := downloadToTemp(ctx, att.Href, false)
+	if err == nil {
+		return path, size, nil
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
+		log.Printf("[files] direct %q -> HTTP %d, пробуем прокси /api/tenders/file", att.RealName, status)
+		proxyURL := tenderplanAPI + "/tenders/file?href=" + url.QueryEscape(att.Href)
+		_, path, size, err = downloadToTemp(ctx, proxyURL, true)
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	return path, size, nil
+}
+
+// downloadToTemp качает URL во временный файл; bearer=true добавляет Authorization.
+func downloadToTemp(ctx context.Context, u string, bearer bool) (int, string, int64, error) {
+	fctx, cancel := context.WithTimeout(ctx, fileDownloadTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(fctx, "GET", u, nil)
+	if err != nil {
+		return 0, "", 0, err
+	}
+	if bearer {
+		req.Header.Set("Authorization", "Bearer "+tenderplanKey)
+	}
+	resp, err := fileClient.Do(req)
+	if err != nil {
+		return 0, "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, "", 0, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	tmp, err := os.CreateTemp(os.TempDir(), "tender-*.bin")
+	if err != nil {
+		return 0, "", 0, err
+	}
+	size, err := io.Copy(tmp, resp.Body)
+	tmp.Close()
+	if err != nil {
+		os.Remove(tmp.Name())
+		return 0, "", 0, err
+	}
+	return resp.StatusCode, tmp.Name(), size, nil
+}
+
+// uploadFileToDrive загружает локальный файл в Lark Drive (bitable_file) и возвращает file_token.
+// Потоковая multipart-отправка через io.Pipe — файл не читается в память целиком.
+func uploadFileToDrive(ctx context.Context, localPath, fileName string, size int64) (string, error) {
+	token, err := getTenantToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		var werr error
+		defer func() {
+			if werr != nil {
+				_ = pw.CloseWithError(werr)
+			} else {
+				_ = pw.Close()
+			}
+		}()
+		fields := map[string]string{
+			"file_name":   fileName,
+			"parent_type": "bitable_file",
+			"parent_node": bitableApp,
+			"size":        strconv.FormatInt(size, 10),
+		}
+		for k, v := range fields {
+			if werr = mw.WriteField(k, v); werr != nil {
+				return
+			}
+		}
+		var part io.Writer
+		if part, werr = mw.CreateFormFile("file", fileName); werr != nil {
+			return
+		}
+		var f *os.File
+		if f, werr = os.Open(localPath); werr != nil {
+			return
+		}
+		defer f.Close()
+		if _, werr = io.Copy(part, f); werr != nil {
+			return
+		}
+		werr = mw.Close()
+	}()
+
+	u := larkBase + "/drive/v1/medias/upload_all"
+	req, _ := http.NewRequestWithContext(ctx, "POST", u, pr)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			FileToken string `json:"file_token"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", err
+	}
+	if out.Code != 0 || out.Data.FileToken == "" {
+		return "", fmt.Errorf("upload_all code=%d msg=%s", out.Code, out.Msg)
+	}
+	return out.Data.FileToken, nil
+}
+
+// updateRecordFiles пишет file_token'ы в поле «Файлы» и отмечает «ФайлыЗагружены»=true.
+// При отсутствии полей — пробует создать их и повторить; если не вышло — обновляет без спорного поля.
+func updateRecordFiles(ctx context.Context, recordID string, fileTokens []string) error {
+	atts := make([]map[string]string, 0, len(fileTokens))
+	for _, ft := range fileTokens {
+		atts = append(atts, map[string]string{"file_token": ft})
+	}
+	fields := map[string]any{
+		"Файлы":          atts,
+		"ФайлыЗагружены": true,
+	}
+	err := putRecord(ctx, recordID, fields)
+	if err == nil {
+		return nil
+	}
+	var le *larkError
+	if !asLarkError(err, &le) || !isFieldNotFound(le.Code, le.Msg) {
+		return err
+	}
+	log.Printf("[files] поле не найдено (%s), создаём и повторяем", le.Msg)
+	_ = ensureBitableField(ctx, "Файлы", "Attachment")
+	_ = ensureBitableField(ctx, "ФайлыЗагружены", "Checkbox")
+	if err = putRecord(ctx, recordID, fields); err == nil {
+		return nil
+	}
+	// fallback: только вложения, без чекбокса
+	delete(fields, "ФайлыЗагружены")
+	return putRecord(ctx, recordID, fields)
+}
+
+func putRecord(ctx context.Context, recordID string, fields map[string]any) error {
+	u := fmt.Sprintf("%s/bitable/v1/apps/%s/tables/%s/records/%s", larkBase, bitableApp, bitableTable, recordID)
+	body, err := larkJSON(ctx, "PUT", u, map[string]any{"fields": fields})
+	if err != nil {
+		return err
+	}
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	_ = json.Unmarshal(body, &out)
+	if out.Code != 0 {
+		return &larkError{Code: out.Code, Msg: out.Msg}
+	}
+	return nil
+}
+
+// findRecordsForFiles ищет карточки «На рассмотрении» без загруженных файлов.
+// Основной фильтр: Статус="На рассмотрении" AND ФайлыЗагружены=false.
+// Если поле ФайлыЗагружены отсутствует — fallback: Статус + пустое поле «Файлы».
+func findRecordsForFiles(ctx context.Context) ([]bitableRecord, error) {
+	fields := []string{"Номер", "Статус", "TenderplanID", "Файлы", "ФайлыЗагружены"}
+	recs, err := bitableSearch(ctx, []map[string]any{
+		{"field_name": "Статус", "operator": "is", "value": []string{"На рассмотрении"}},
+		{"field_name": "ФайлыЗагружены", "operator": "is", "value": []string{"false"}},
+	}, fields)
+	if err == nil {
+		return recs, nil
+	}
+	var le *larkError
+	if !asLarkError(err, &le) || !isFieldNotFound(le.Code, le.Msg) {
+		return nil, err
+	}
+	log.Printf("[files] поле ФайлыЗагружены отсутствует (%s), fallback на пустое поле «Файлы»", le.Msg)
+	return bitableSearch(ctx, []map[string]any{
+		{"field_name": "Статус", "operator": "is", "value": []string{"На рассмотрении"}},
+		{"field_name": "Файлы", "operator": "isEmpty", "value": []string{}},
+	}, []string{"Номер", "Статус", "TenderplanID", "Файлы"})
+}
+
+// processFileDownloads — основной проход файлового пайплайна.
+func processFileDownloads(ctx context.Context) fileRunResult {
+	filesRunMu.Lock()
+	defer filesRunMu.Unlock()
+
+	res := fileRunResult{StartedAt: time.Now().Format(time.RFC3339)}
+	defer func() { res.FinishedAt = time.Now().Format(time.RFC3339) }()
+
+	recs, err := findRecordsForFiles(ctx)
+	if err != nil {
+		res.Errors = append(res.Errors, "search: "+err.Error())
+		return res
+	}
+	res.RecordsFound = len(recs)
+	log.Printf("[files] карточек «На рассмотрении» без файлов: %d", len(recs))
+
+	for _, rec := range recs {
+		number := bitableText(rec.Fields["Номер"])
+		// клиентская перестраховка: пропускаем, если файлы уже есть или чекбокс отмечен
+		if done, _ := rec.Fields["ФайлыЗагружены"].(bool); done {
+			continue
+		}
+		if atts, ok := rec.Fields["Файлы"].([]any); ok && len(atts) > 0 {
+			continue
+		}
+		tenderID := bitableText(rec.Fields["TenderplanID"])
+		if tenderID == "" {
+			res.Errors = append(res.Errors, number+": пустой TenderplanID")
+			continue
+		}
+
+		atts, err := fetchAttachments(ctx, tenderID)
+		if err != nil {
+			res.Errors = append(res.Errors, number+": attachments "+err.Error())
+			continue
+		}
+		if len(atts) == 0 {
+			log.Printf("[files] %s (%s): файлов нет — отмечаем ФайлыЗагружены", number, tenderID)
+			if err := updateRecordFiles(ctx, rec.RecordID, nil); err != nil {
+				res.Errors = append(res.Errors, number+": mark-empty "+err.Error())
+				continue
+			}
+			res.RecordsDone++
+			continue
+		}
+
+		var tokens []string
+		for _, att := range atts {
+			name := sanitizeFileName(att.RealName)
+			if att.RealName == "" {
+				name = sanitizeFileName(att.DisplayName)
+			}
+			path, size, err := downloadAttachment(ctx, att)
+			if err != nil {
+				res.FilesFailed++
+				res.Errors = append(res.Errors, fmt.Sprintf("%s: %s download: %v", number, name, err))
+				log.Printf("[files] %s: %s — ошибка скачивания: %v", number, name, err)
+				continue
+			}
+			res.FilesDownloaded++
+			token, err := uploadFileToDrive(ctx, path, name, size)
+			os.Remove(path) // временный файл больше не нужен
+			if err != nil {
+				res.FilesFailed++
+				res.Errors = append(res.Errors, fmt.Sprintf("%s: %s upload: %v", number, name, err))
+				log.Printf("[files] %s: %s (%d bytes) — ошибка загрузки в Lark: %v", number, name, size, err)
+				continue
+			}
+			res.FilesUploaded++
+			tokens = append(tokens, token)
+			log.Printf("[files] %s: %s (%d bytes) — загружен, file_token=%s", number, name, size, token)
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		if len(tokens) == 0 {
+			continue // все файлы упали — карточку не трогаем, повторим в следующем проходе
+		}
+		if err := updateRecordFiles(ctx, rec.RecordID, tokens); err != nil {
+			res.Errors = append(res.Errors, number+": update record "+err.Error())
+			continue
+		}
+		res.RecordsDone++
+		log.Printf("[files] %s: карточка обновлена, файлов: %d", number, len(tokens))
+	}
+	return res
+}
+
+// scheduleFileDownloads — периодический опрос каждые filesPollInterval.
+func scheduleFileDownloads(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(filesPollInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				log.Printf("[files] плановый проход файлового пайплайна")
+				res := processFileDownloads(ctx)
+				log.Printf("[files] done: records=%d/%d downloaded=%d uploaded=%d failed=%d errors=%d",
+					res.RecordsDone, res.RecordsFound, res.FilesDownloaded, res.FilesUploaded, res.FilesFailed, len(res.Errors))
+			}
+		}
+	}()
+}
+
 // ===== HMAC VERIFY =====
 
 func verifyHMAC(body []byte, signature, secret string) bool {
@@ -406,6 +1139,10 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func (h *server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	writeJSON(w, 200, map[string]string{"status": "ok", "service": "tender-monitor"})
 }
 
@@ -415,6 +1152,16 @@ func (h *server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res := processTenders(r.Context())
+	writeJSON(w, 200, res)
+}
+
+// handleFilesRun — ручной запуск файлового пайплайна: POST /files/run.
+func (h *server) handleFilesRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	res := processFileDownloads(r.Context())
 	writeJSON(w, 200, res)
 }
 
@@ -451,16 +1198,18 @@ func (h *server) handleListTenders(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	url := fmt.Sprintf("%s/bitable/v1/apps/%s/tables/%s/records/search", larkBase, bitableApp, bitableTable)
+	u := fmt.Sprintf("%s/bitable/v1/apps/%s/tables/%s/records/search", larkBase, bitableApp, bitableTable)
 	bodyMap := map[string]any{}
 	if status != "" {
-		bodyMap["filter"] = map[string]any{"and": []any{map[string]any{"field_name": "Статус", "operator": "is", "value": []string{status}}}}
+		bodyMap["filter"] = map[string]any{"conjunction": "and", "conditions": []any{
+			map[string]any{"field_name": "Статус", "operator": "is", "value": []string{status}},
+		}}
 	}
 	body, _ := json.Marshal(bodyMap)
-	req, _ := http.NewRequestWithContext(r.Context(), "POST", url, bytes.NewReader(body))
+	req, _ := http.NewRequestWithContext(r.Context(), "POST", u, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		writeJSON(w, 502, map[string]string{"error": err.Error()})
 		return
@@ -516,11 +1265,13 @@ func main() {
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	scheduleDaily(rootCtx)
+	scheduleFileDownloads(rootCtx)
 
 	mux := http.NewServeMux()
 	h := &server{}
 	mux.HandleFunc("/", h.handleRoot)
 	mux.HandleFunc("/run", h.handleRun)
+	mux.HandleFunc("/files/run", h.handleFilesRun)
 	mux.HandleFunc("/webhook/mail-tenders", h.handleMailTenders)
 	mux.HandleFunc("/tenders", h.handleListTenders)
 
