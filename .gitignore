@@ -5,8 +5,12 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+bin/
+pkg/
 .idea/
 .vscode/
 .DS_Store
 *.zip
 !tender-monitor-deploy-*.zip
+# Legacy Python entry point — заменён на main.go
+main.py
