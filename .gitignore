@@ -1,0 +1,12 @@
+.env
+.env.local
+*.bak.*
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+*.zip
+!tender-monitor-deploy-*.zip
