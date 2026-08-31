@@ -32,7 +32,7 @@ const (
 	kimiAPI             = "https://api.moonshot.ai/v1/chat/completions"
 	kimiModel           = "kimi-k2.6"
 	larkBase            = "https://open.larksuite.com/open-apis"
-	listenAddr          = ":8787"
+	listenAddr          = "0.0.0.0:8787" // IPv4 явно: WSL localhostForwarding не пробрасывает tcp6-only сокеты
 	dailyRunHour        = 8
 	dailyRunMinute      = 0
 	filesPollInterval   = 5 * time.Minute // периодический опрос карточек «На рассмотрении»
