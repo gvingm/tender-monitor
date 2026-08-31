@@ -499,16 +499,16 @@ func findRecordByNumber(ctx context.Context, number string) (bool, error) {
 	return len(recs) > 0, nil
 }
 
-// ensureBitableField создаёт поле в таблице (Text/Attachment/Checkbox).
+// ensureBitableField создаёт поле в таблице (Text=1, Attachment=17, Checkbox=7).
 // Ошибки (в т.ч. «поле уже существует») логируются, но не считаются фатальными.
-func ensureBitableField(ctx context.Context, fieldName, uiType string) error {
+func ensureBitableField(ctx context.Context, fieldName string, fieldType int) error {
 	u := fmt.Sprintf("%s/bitable/v1/apps/%s/tables/%s/fields", larkBase, bitableApp, bitableTable)
 	body, err := larkJSON(ctx, "POST", u, map[string]any{
 		"field_name": fieldName,
-		"ui_type":    uiType,
+		"type":       fieldType,
 	})
 	if err != nil {
-		log.Printf("[bitable] create field %q (%s): %v", fieldName, uiType, err)
+		log.Printf("[bitable] create field %q (type=%d): %v", fieldName, fieldType, err)
 		return err
 	}
 	var out struct {
@@ -517,10 +517,10 @@ func ensureBitableField(ctx context.Context, fieldName, uiType string) error {
 	}
 	_ = json.Unmarshal(body, &out)
 	if out.Code != 0 {
-		log.Printf("[bitable] create field %q (%s): code=%d %s", fieldName, uiType, out.Code, out.Msg)
+		log.Printf("[bitable] create field %q (type=%d): code=%d %s", fieldName, fieldType, out.Code, out.Msg)
 		return &larkError{Code: out.Code, Msg: out.Msg}
 	}
-	log.Printf("[bitable] поле %q (%s) создано", fieldName, uiType)
+	log.Printf("[bitable] поле %q (type=%d) создано", fieldName, fieldType)
 	return nil
 }
 
@@ -563,7 +563,7 @@ func addToBitable(ctx context.Context, t Tender, cluster, summary string) (bitab
 		var le *larkError
 		if ok := asLarkError(err, &le); ok && isFieldNotFound(le.Code, le.Msg) {
 			log.Printf("[bitable] поле не найдено (%s), пробуем создать и повторить", le.Msg)
-			_ = ensureBitableField(ctx, "TenderplanID", "Text")
+			_ = ensureBitableField(ctx, "TenderplanID", 1)
 			code, rec, err = createBitableRecord(ctx, fields)
 			if err != nil {
 				// не падаем: повторяем без спорного поля
@@ -999,8 +999,8 @@ func updateRecordFiles(ctx context.Context, recordID string, fileTokens []string
 		return err
 	}
 	log.Printf("[files] поле не найдено (%s), создаём и повторяем", le.Msg)
-	_ = ensureBitableField(ctx, "Файлы", "Attachment")
-	_ = ensureBitableField(ctx, "ФайлыЗагружены", "Checkbox")
+	_ = ensureBitableField(ctx, "Файлы", 17)
+	_ = ensureBitableField(ctx, "ФайлыЗагружены", 7)
 	if err = putRecord(ctx, recordID, fields); err == nil {
 		return nil
 	}
