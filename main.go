@@ -97,6 +97,17 @@ var fileClient = &http.Client{
 	},
 }
 
+// kimiClient — отдельный клиент с длинным таймаутом: kimi-k2.6 — reasoning-модель,
+// генерация с «размышлениями» может занимать 60-120 секунд.
+var kimiClient = &http.Client{
+	Timeout: 180 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // ===== LARK AUTH =====
 
 type tokenCache struct {
@@ -338,17 +349,19 @@ func kimiSummarize(ctx context.Context, t Tender) (string, error) {
 Рекомендация: [подавать/не подавать]`,
 		t.Name, t.Customer, t.Description, formatAmount(t.Amount), t.Region, t.Deadline)
 
-	// ВАЖНО: max_tokens >= 512 — иначе из-за reasoning-модели ответ приходит пустым.
+	// ВАЖНО: reasoning-модель съедает токены на «размышления» — нужен запас,
+	// иначе content приходит пустым (finish_reason=length). И длинный таймаут.
+	// temperature НЕ передаём: kimi-k2.6 принимает только temperature=1,
+	// другое значение → HTTP 400 invalid_request_error.
 	body, _ := json.Marshal(map[string]any{
-		"model":       kimiModel,
-		"messages":    []map[string]string{{"role": "user", "content": prompt}},
-		"temperature": 0.3,
-		"max_tokens":  1024,
+		"model":      kimiModel,
+		"messages":   []map[string]string{{"role": "user", "content": prompt}},
+		"max_tokens": 4096,
 	})
 	req, _ := http.NewRequestWithContext(ctx, "POST", kimiAPI, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+kimiKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := apiClient.Do(req)
+	resp, err := kimiClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -692,10 +705,13 @@ func processTenders(ctx context.Context) runResults {
 					log.Printf("[tenderplan] href %s: %v", t.ID, err)
 				}
 			}
+			// Kimi — опционально: при ошибке/лимите API тендер НЕ теряем,
+			// пишем в Bitable без резюме (пометка в поле).
 			summary, err := kimiSummarize(ctx, t)
 			if err != nil {
+				log.Printf("[run] kimi %s: %v", t.Number, err)
 				res.Errors = append(res.Errors, t.Number+": kimi "+err.Error())
-				continue
+				summary = "⚠️ Резюме недоступно: ошибка Kimi API (см. логи). Данные тендера — в полях карточки."
 			}
 			r, err := addToBitable(ctx, t, name, summary)
 			if err != nil {
@@ -724,10 +740,12 @@ func processMailTenders(ctx context.Context, tenders []Tender) runResults {
 	res := runResults{}
 	for _, t := range tenders {
 		cluster := classifyCluster(t)
+		// Kimi — опционально: при ошибке/лимите API тендер не теряем
 		summary, err := kimiSummarize(ctx, t)
 		if err != nil {
+			log.Printf("[mail] kimi %s: %v", t.Number, err)
 			res.Errors = append(res.Errors, t.Number+": kimi "+err.Error())
-			continue
+			summary = "⚠️ Резюме недоступно: ошибка Kimi API (см. логи). Данные тендера — в полях карточки."
 		}
 		r, err := addToBitable(ctx, t, cluster, summary)
 		if err != nil {
