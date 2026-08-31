@@ -1166,13 +1166,27 @@ func (h *server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok", "service": "tender-monitor"})
 }
 
+var monitorRunMu sync.Mutex // защита от параллельных запусков мониторинга
+
 func (h *server) handleRun(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	res := processTenders(r.Context())
-	writeJSON(w, 200, res)
+	// Полный цикл долгий (Kimi по каждому тендеру): HTTP-запрос отвалится раньше.
+	// Запускаем в фоне с собственным контекстом — отключение клиента не убивает работу.
+	if !monitorRunMu.TryLock() {
+		writeJSON(w, 409, map[string]string{"status": "already_running"})
+		return
+	}
+	go func() {
+		defer monitorRunMu.Unlock()
+		log.Printf("[run] старт полного цикла мониторинга")
+		res := processTenders(context.Background())
+		log.Printf("[run] done: processed=%d added=%d duplicates=%d errors=%d %v",
+			res.Processed, res.Added, res.Duplicates, len(res.Errors), res.Errors)
+	}()
+	writeJSON(w, 202, map[string]string{"status": "started", "hint": "смотрите логи контейнера: [run] done: ..."})
 }
 
 // handleFilesRun — ручной запуск файлового пайплайна: POST /files/run.
