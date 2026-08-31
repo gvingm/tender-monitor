@@ -37,7 +37,8 @@ const (
 	dailyRunMinute      = 0
 	filesPollInterval   = 5 * time.Minute // периодический опрос карточек «На рассмотрении»
 	fileDownloadTimeout = 60 * time.Second // таймаут на скачивание одного файла
-	maxListPages        = 3                // максимум страниц getlist на кластер (защита от лимитов)
+	maxListPages        = 1                // страниц getlist на ключевое слово (50/стр.; дневному дайджесту хватает)
+	maxNewPerRun        = 20               // максимум новых тендеров за прогон (Kimi дорогой, чат не спамим)
 	tpRequestPause      = 250 * time.Millisecond
 	tokenTTL            = 2 * time.Hour
 
@@ -225,49 +226,64 @@ func tpGet(ctx context.Context, u string, out any) error {
 
 // fetchTenders — выборка тендеров кластера через v2/getlist с пагинацией (page=0,1,2...).
 // since (RFC3339, опционально) маппится в fromPublicationDateTime (мс).
+//
+// ВАЖНО: Tenderplan НЕ поддерживает синтаксис "OR" в q — OR-запрос возвращает 0
+// (проверено эмпирически 2026-08-31). Поэтому опрашиваем КАЖДОЕ ключевое слово
+// отдельно и склеиваем результат с дедупликацией по _id.
 func fetchTenders(ctx context.Context, clusterName string, keywords []string, since string) ([]Tender, error) {
-	q := strings.Join(keywords, " OR ")
 	var all []Tender
-	for page := 0; page < maxListPages; page++ {
-		u := fmt.Sprintf("%s/tenders/v2/getlist?q=%s&page=%d",
-			tenderplanAPI, url.QueryEscape(q), page)
-		if since != "" {
-			if ts, err := time.Parse(time.RFC3339, since); err == nil {
-				u += "&fromPublicationDateTime=" + strconv.FormatInt(ts.UnixMilli(), 10)
-			}
-		}
-		var out tpListResponse
-		if err := tpGet(ctx, u, &out); err != nil {
-			return all, fmt.Errorf("%s page=%d: %w", clusterName, page, err)
-		}
-		if len(out.Tenders) == 0 {
-			break
-		}
-		for i, st := range out.Tenders {
-			t := Tender{
-				ID:       st.ID,
-				Number:   st.Number,
-				Name:     st.OrderName,
-				Region:   rawToString(st.Region),
-				Title:    st.OrderName,
-				Deadline: msToRFC3339(st.SubmissionCloseDateTime),
-			}
-			if st.MaxPrice != nil {
-				t.Amount = *st.MaxPrice
-			}
-			if len(st.Customers) > 0 {
-				t.Customer = st.Customers[0].Name
-				if t.Region == "" {
-					t.Region = strconv.Itoa(st.Customers[0].Region)
+	seen := map[string]bool{}
+	var errs []string
+	for _, kw := range keywords {
+		for page := 0; page < maxListPages; page++ {
+			u := fmt.Sprintf("%s/tenders/v2/getlist?q=%s&page=%d",
+				tenderplanAPI, url.QueryEscape(kw), page)
+			if since != "" {
+				if ts, err := time.Parse(time.RFC3339, since); err == nil {
+					u += "&fromPublicationDateTime=" + strconv.FormatInt(ts.UnixMilli(), 10)
 				}
 			}
-			// href: из короткой модели, либо из полной модели первого элемента выборки.
-			t.URL = st.Href
-			if t.URL == "" && page == 0 && i == 0 && out.Tender != nil && out.Tender.ID == st.ID {
-				t.URL = out.Tender.Href
+			var out tpListResponse
+			if err := tpGet(ctx, u, &out); err != nil {
+				errs = append(errs, fmt.Sprintf("%s[%s] page=%d: %v", clusterName, kw, page, err))
+				break
 			}
-			all = append(all, t)
+			if len(out.Tenders) == 0 {
+				break
+			}
+			for i, st := range out.Tenders {
+				if st.ID == "" || seen[st.ID] {
+					continue
+				}
+				seen[st.ID] = true
+				t := Tender{
+					ID:       st.ID,
+					Number:   st.Number,
+					Name:     st.OrderName,
+					Region:   rawToString(st.Region),
+					Title:    st.OrderName,
+					Deadline: msToRFC3339(st.SubmissionCloseDateTime),
+				}
+				if st.MaxPrice != nil {
+					t.Amount = *st.MaxPrice
+				}
+				if len(st.Customers) > 0 {
+					t.Customer = st.Customers[0].Name
+					if t.Region == "" {
+						t.Region = strconv.Itoa(st.Customers[0].Region)
+					}
+				}
+				// href: из короткой модели, либо из полной модели первого элемента выборки.
+				t.URL = st.Href
+				if t.URL == "" && page == 0 && i == 0 && out.Tender != nil && out.Tender.ID == st.ID {
+					t.URL = out.Tender.Href
+				}
+				all = append(all, t)
+			}
 		}
+	}
+	if len(all) == 0 && len(errs) > 0 {
+		return nil, fmt.Errorf("%s: %s", clusterName, strings.Join(errs, "; "))
 	}
 	return all, nil
 }
@@ -693,6 +709,10 @@ func processTenders(ctx context.Context) runResults {
 				res.Added++
 				if err := notifyLark(ctx, t, name, summary); err != nil {
 					res.Errors = append(res.Errors, t.Number+": notify "+err.Error())
+				}
+				if res.Added >= maxNewPerRun {
+					log.Printf("[run] достигнут лимит %d новых за прогон, остаток — в следующие запуски", maxNewPerRun)
+					return res
 				}
 			}
 		}
