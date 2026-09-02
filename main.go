@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,13 +31,18 @@ import (
 const (
 	tenderplanAPI       = "https://tenderplan.ru/api"
 	kimiAPI             = "https://api.moonshot.ai/v1/chat/completions"
+	kimiFilesAPI        = "https://api.moonshot.ai/v1/files" // Kimi Files API (загрузка ТЗ для анализа)
 	kimiModel           = "kimi-k2.6"
 	larkBase            = "https://open.larksuite.com/open-apis"
 	listenAddr          = "0.0.0.0:8787" // IPv4 явно: WSL localhostForwarding не пробрасывает tcp6-only сокеты
 	dailyRunHour        = 8
 	dailyRunMinute      = 0
-	filesPollInterval   = 5 * time.Minute // периодический опрос карточек «На рассмотрении»
+	filesPollInterval   = 5 * time.Minute  // периодический опрос карточек «На рассмотрении»
+	marksPollInterval   = 5 * time.Minute  // периодический опрос меток Tenderplan (воронка «интересные»)
+	marksMaxPages       = 10               // cap страниц v1 getlist при опросе меток (50/стр.)
 	fileDownloadTimeout = 60 * time.Second // таймаут на скачивание одного файла
+	maxAnalysisFileSize = 50 << 20         // файлы >50 МБ в анализ ТЗ не берём
+	analysisRetryDelay  = time.Hour        // минимальный интервал между попытками анализа ТЗ одной записи
 	maxListPages        = 1                // страниц getlist на ключевое слово (50/стр.; дневному дайджесту хватает)
 	maxNewPerRun        = 20               // максимум новых тендеров за прогон (Kimi дорогой, чат не спамим)
 	tpRequestPause      = 250 * time.Millisecond
@@ -74,6 +80,30 @@ var clusters = map[string][]string{
 	"Малый техфлот": {"земснаряд", "буксир", "шаланда", "понтон", "катер", "моторная яхта", "маломерное судно"},
 	"Иное":          {"дноуглубление", "дноуглубительные работы", "судостроение", "гидротехника", "аренда флота"},
 }
+
+// moscowTZ — локальная тайзона для подписей воронок; если в контейнере нет tzdata —
+// фиксированный UTC+3 (Europe/Moscow без исторических переходов).
+var moscowTZ = func() *time.Location {
+	if l, err := time.LoadLocation("Europe/Moscow"); err == nil {
+		return l
+	}
+	return time.FixedZone("MSK", 3*60*60)
+}()
+
+// voronkaNewLabel — значение поля «Воронка» для новых тендеров текущего прогона.
+func voronkaNewLabel() string {
+	return "новые от " + time.Now().In(moscowTZ).Format("02.01.2006")
+}
+
+// Регулярные выражения новой логики (воронки / метки / анализ ТЗ).
+var (
+	// interestingMarkRe — имя метки Tenderplan «Интересно» (и производные).
+	interestingMarkRe = regexp.MustCompile(`(?i)интерес`)
+	// dredgeRe — признак дноуглубительного тендера в названии.
+	dredgeRe = regexp.MustCompile(`(?i)(дноуглуб|расчистк[аи]\s+русл|углублени[ея]\s+(дна|русл|акватор))`)
+	// tzFileRe — признак файла ТЗ в имени вложения.
+	tzFileRe = regexp.MustCompile(`(?i)(тз|техническ|задание)`)
+)
 
 // ===== HTTP CLIENTS =====
 // Один общий клиент с keep-alive для всех API; файлы — отдельный клиент без
@@ -192,7 +222,7 @@ type tpShortTender struct {
 
 type tpListResponse struct {
 	// "tender" — полная модель первого тендера выборки (можно взять href без лишнего запроса).
-	Tender  *struct {
+	Tender *struct {
 		ID   string `json:"_id"`
 		Href string `json:"href"`
 	} `json:"tender"`
@@ -299,25 +329,41 @@ func fetchTenders(ctx context.Context, clusterName string, keywords []string, si
 	return all, nil
 }
 
+// tpFullTender — полная модель тендера (GET /api/tenders/get?id=<_id>): нужные нам поля.
+type tpFullTender struct {
+	Href              string `json:"href"`
+	OrderName         string `json:"orderName"`
+	Description       string `json:"description"`
+	NoticeDescription string `json:"noticeDescription"`
+}
+
+// fetchTenderDetails догружает полную модель тендера (ссылка, название, описание).
+// Некоторые версии API заворачивают модель в {"tender": {...}} — поддерживаем оба варианта.
+func fetchTenderDetails(ctx context.Context, id string) (tpFullTender, error) {
+	var raw json.RawMessage
+	if err := tpGet(ctx, tenderplanAPI+"/tenders/get?id="+url.QueryEscape(id), &raw); err != nil {
+		return tpFullTender{}, err
+	}
+	var direct tpFullTender
+	if err := json.Unmarshal(raw, &direct); err == nil && (direct.Href != "" || direct.OrderName != "") {
+		return direct, nil
+	}
+	var wrap struct {
+		Tender *tpFullTender `json:"tender"`
+	}
+	if err := json.Unmarshal(raw, &wrap); err == nil && wrap.Tender != nil {
+		return *wrap.Tender, nil
+	}
+	return direct, nil
+}
+
 // fetchTenderHref догружает полную модель тендера ради ссылки на площадку-источник.
 func fetchTenderHref(ctx context.Context, id string) (string, error) {
-	var out struct {
-		Href string `json:"href"`
-		// некоторые версии API заворачивают модель
-		Tender *struct {
-			Href string `json:"href"`
-		} `json:"tender"`
-	}
-	if err := tpGet(ctx, tenderplanAPI+"/tenders/get?id="+url.QueryEscape(id), &out); err != nil {
+	d, err := fetchTenderDetails(ctx, id)
+	if err != nil {
 		return "", err
 	}
-	if out.Href != "" {
-		return out.Href, nil
-	}
-	if out.Tender != nil {
-		return out.Tender.Href, nil
-	}
-	return "", nil
+	return d.Href, nil
 }
 
 func msToRFC3339(ms int64) string {
@@ -525,9 +571,10 @@ func ensureBitableField(ctx context.Context, fieldName string, fieldType int) er
 }
 
 // addToBitable: проверка дублей + создание записи. Поле «Заказчик» = кластер (как раньше).
-// TenderplanID пишется для последующего скачивания файлов; при ошибке «поле не существует»
+// voronka (если не пусто) пишется в поле «Воронка» («новые от ДД.ММ.ГГГГ» / «интересные»).
+// TenderplanID и «Воронка» пишутся для последующей обработки; при ошибке «поле не существует»
 // поле создаётся, а если и это не удалось — запись создаётся без него.
-func addToBitable(ctx context.Context, t Tender, cluster, summary string) (bitableResult, error) {
+func addToBitable(ctx context.Context, t Tender, cluster, summary, voronka string) (bitableResult, error) {
 	deadline := any(nil)
 	if t.Deadline != "" {
 		if ts, err := time.Parse(time.RFC3339, t.Deadline); err == nil {
@@ -547,6 +594,9 @@ func addToBitable(ctx context.Context, t Tender, cluster, summary string) (bitab
 	if t.ID != "" {
 		fields["TenderplanID"] = t.ID
 	}
+	if voronka != "" {
+		fields["Воронка"] = voronka
+	}
 
 	// duplicate check
 	dup, err := findRecordByNumber(ctx, t.Number)
@@ -564,11 +614,15 @@ func addToBitable(ctx context.Context, t Tender, cluster, summary string) (bitab
 		if ok := asLarkError(err, &le); ok && isFieldNotFound(le.Code, le.Msg) {
 			log.Printf("[bitable] поле не найдено (%s), пробуем создать и повторить", le.Msg)
 			_ = ensureBitableField(ctx, "TenderplanID", 1)
+			if voronka != "" {
+				_ = ensureBitableField(ctx, "Воронка", 1)
+			}
 			code, rec, err = createBitableRecord(ctx, fields)
 			if err != nil {
-				// не падаем: повторяем без спорного поля
+				// не падаем: повторяем без спорных полей
 				if ok := asLarkError(err, &le); ok && isFieldNotFound(le.Code, le.Msg) {
 					delete(fields, "TenderplanID")
+					delete(fields, "Воронка")
 					code, rec, err = createBitableRecord(ctx, fields)
 				}
 			}
@@ -578,6 +632,18 @@ func addToBitable(ctx context.Context, t Tender, cluster, summary string) (bitab
 		return bitableResult{}, err
 	}
 	return bitableResult{Code: code, Record: rec}, nil
+}
+
+// recordIDFromCreate извлекает record_id из ответа createBitableRecord.
+func recordIDFromCreate(rec any) string {
+	m, ok := rec.(map[string]any)
+	if !ok {
+		return ""
+	}
+	data, _ := m["data"].(map[string]any)
+	r, _ := data["record"].(map[string]any)
+	id, _ := r["record_id"].(string)
+	return id
 }
 
 func asLarkError(err error, out **larkError) bool {
@@ -679,6 +745,7 @@ type runResults struct {
 
 func processTenders(ctx context.Context) runResults {
 	res := runResults{}
+	voronka := voronkaNewLabel() // воронка для новых записей этого прогона (дата по Europe/Moscow)
 	for name, kws := range clusters {
 		tenders, err := fetchTenders(ctx, name, kws, "")
 		if err != nil {
@@ -713,7 +780,7 @@ func processTenders(ctx context.Context) runResults {
 				res.Errors = append(res.Errors, t.Number+": kimi "+err.Error())
 				summary = "⚠️ Резюме недоступно: ошибка Kimi API (см. логи). Данные тендера — в полях карточки."
 			}
-			r, err := addToBitable(ctx, t, name, summary)
+			r, err := addToBitable(ctx, t, name, summary, voronka)
 			if err != nil {
 				res.Errors = append(res.Errors, t.Number+": bitable "+err.Error())
 				continue
@@ -747,7 +814,7 @@ func processMailTenders(ctx context.Context, tenders []Tender) runResults {
 			res.Errors = append(res.Errors, t.Number+": kimi "+err.Error())
 			summary = "⚠️ Резюме недоступно: ошибка Kimi API (см. логи). Данные тендера — в полях карточки."
 		}
-		r, err := addToBitable(ctx, t, cluster, summary)
+		r, err := addToBitable(ctx, t, cluster, summary, "")
 		if err != nil {
 			res.Errors = append(res.Errors, t.Number+": bitable "+err.Error())
 			continue
@@ -785,6 +852,7 @@ type fileRunResult struct {
 	FilesDownloaded int      `json:"files_downloaded"`
 	FilesUploaded   int      `json:"files_uploaded"`
 	FilesFailed     int      `json:"files_failed"`
+	TZAnalyses      int      `json:"tz_analyses"` // выполненных анализов ТЗ (дноуглубительные из «интересные»)
 	Errors          []string `json:"errors,omitempty"`
 }
 
@@ -1049,91 +1117,210 @@ func findRecordsForFiles(ctx context.Context) ([]bitableRecord, error) {
 	}, []string{"Номер", "Статус", "TenderplanID", "Файлы"})
 }
 
+// dlFile — скачанный локально файл вложения (для загрузки в Lark и/или анализа ТЗ).
+type dlFile struct {
+	att  tpAttachment
+	path string
+	name string
+	size int64
+}
+
+// findInterestingRecords ищет карточки воронки «интересные» без загруженных файлов.
+// Основной фильтр: Воронка="интересные" AND ФайлыЗагружены=false.
+// Если поле ФайлыЗагружены отсутствует — fallback: Воронка + пустое поле «Файлы».
+func findInterestingRecords(ctx context.Context) ([]bitableRecord, error) {
+	fields := []string{"Номер", "TenderplanID", "Файлы", "ФайлыЗагружены", "Воронка", "Анализ ТЗ"}
+	recs, err := bitableSearch(ctx, []map[string]any{
+		{"field_name": "Воронка", "operator": "is", "value": []string{"интересные"}},
+		{"field_name": "ФайлыЗагружены", "operator": "is", "value": []string{"false"}},
+	}, fields)
+	if err == nil {
+		return recs, nil
+	}
+	var le *larkError
+	if !asLarkError(err, &le) || !isFieldNotFound(le.Code, le.Msg) {
+		return nil, err
+	}
+	log.Printf("[воронки] поле ФайлыЗагружены отсутствует (%s), fallback на пустое поле «Файлы»", le.Msg)
+	return bitableSearch(ctx, []map[string]any{
+		{"field_name": "Воронка", "operator": "is", "value": []string{"интересные"}},
+		{"field_name": "Файлы", "operator": "isEmpty", "value": []string{}},
+	}, []string{"Номер", "TenderplanID", "Файлы", "Воронка", "Анализ ТЗ"})
+}
+
 // processFileDownloads — основной проход файлового пайплайна.
+// Обрабатывает И карточки «На рассмотрении», И карточки воронки «интересные»
+// (для интересных дноуглубительных после загрузки файлов запускается анализ ТЗ).
 func processFileDownloads(ctx context.Context) fileRunResult {
 	filesRunMu.Lock()
 	defer filesRunMu.Unlock()
 
 	res := fileRunResult{StartedAt: time.Now().Format(time.RFC3339)}
-	defer func() { res.FinishedAt = time.Now().Format(time.RFC3339) }()
+	defer func() {
+		res.FinishedAt = time.Now().Format(time.RFC3339)
+		reportFiles(res)
+	}()
+
+	ensureAnalysisFieldsOnce(ctx)
 
 	recs, err := findRecordsForFiles(ctx)
 	if err != nil {
 		res.Errors = append(res.Errors, "search: "+err.Error())
 		return res
 	}
-	res.RecordsFound = len(recs)
 	log.Printf("[files] карточек «На рассмотрении» без файлов: %d", len(recs))
 
+	// общая очередь: статус «На рассмотрении» + воронка «интересные» (дедуп по record_id)
+	type queueItem struct {
+		rec         bitableRecord
+		interesting bool
+	}
+	queue := map[string]queueItem{}
 	for _, rec := range recs {
-		number := bitableText(rec.Fields["Номер"])
-		// клиентская перестраховка: пропускаем, если файлы уже есть или чекбокс отмечен
-		if done, _ := rec.Fields["ФайлыЗагружены"].(bool); done {
-			continue
+		queue[rec.RecordID] = queueItem{rec: rec}
+	}
+	intRecs, ierr := findInterestingRecords(ctx)
+	if ierr != nil {
+		log.Printf("[воронки] поиск карточек «интересные»: %v", ierr)
+		res.Errors = append(res.Errors, "[воронки] search interesting: "+ierr.Error())
+	} else {
+		log.Printf("[воронки] карточек «интересные» без файлов: %d", len(intRecs))
+		for _, rec := range intRecs {
+			queue[rec.RecordID] = queueItem{rec: rec, interesting: true}
 		}
-		if atts, ok := rec.Fields["Файлы"].([]any); ok && len(atts) > 0 {
-			continue
-		}
-		tenderID := bitableText(rec.Fields["TenderplanID"])
-		if tenderID == "" {
-			res.Errors = append(res.Errors, number+": пустой TenderplanID")
-			continue
-		}
+	}
+	res.RecordsFound = len(queue)
 
-		atts, err := fetchAttachments(ctx, tenderID)
-		if err != nil {
-			res.Errors = append(res.Errors, number+": attachments "+err.Error())
-			continue
+	for _, it := range queue {
+		// для интересных догружаем название тендера (признак «дноуглубительный»),
+		// но только если анализ ТЗ ещё не сделан — чтобы не дёргать API зря
+		name := ""
+		if it.interesting && bitableText(it.rec.Fields["Анализ ТЗ"]) == "" {
+			name = resolveTenderName(ctx, bitableText(it.rec.Fields["TenderplanID"]))
 		}
-		if len(atts) == 0 {
-			log.Printf("[files] %s (%s): файлов нет — отмечаем ФайлыЗагружены", number, tenderID)
-			if err := updateRecordFiles(ctx, rec.RecordID, nil); err != nil {
-				res.Errors = append(res.Errors, number+": mark-empty "+err.Error())
-				continue
-			}
-			res.RecordsDone++
-			continue
-		}
-
-		var tokens []string
-		for _, att := range atts {
-			name := sanitizeFileName(att.RealName)
-			if att.RealName == "" {
-				name = sanitizeFileName(att.DisplayName)
-			}
-			path, size, err := downloadAttachment(ctx, att)
-			if err != nil {
-				res.FilesFailed++
-				res.Errors = append(res.Errors, fmt.Sprintf("%s: %s download: %v", number, name, err))
-				log.Printf("[files] %s: %s — ошибка скачивания: %v", number, name, err)
-				continue
-			}
-			res.FilesDownloaded++
-			token, err := uploadFileToDrive(ctx, path, name, size)
-			os.Remove(path) // временный файл больше не нужен
-			if err != nil {
-				res.FilesFailed++
-				res.Errors = append(res.Errors, fmt.Sprintf("%s: %s upload: %v", number, name, err))
-				log.Printf("[files] %s: %s (%d bytes) — ошибка загрузки в Lark: %v", number, name, size, err)
-				continue
-			}
-			res.FilesUploaded++
-			tokens = append(tokens, token)
-			log.Printf("[files] %s: %s (%d bytes) — загружен, file_token=%s", number, name, size, token)
-			time.Sleep(200 * time.Millisecond)
-		}
-
-		if len(tokens) == 0 {
-			continue // все файлы упали — карточку не трогаем, повторим в следующем проходе
-		}
-		if err := updateRecordFiles(ctx, rec.RecordID, tokens); err != nil {
-			res.Errors = append(res.Errors, number+": update record "+err.Error())
-			continue
-		}
-		res.RecordsDone++
-		log.Printf("[files] %s: карточка обновлена, файлов: %d", number, len(tokens))
+		processRecordFiles(ctx, it.rec, name, it.interesting, &res)
 	}
 	return res
+}
+
+// processRecordFiles — скачивание и загрузка файлов одной карточки (общая логика
+// для статуса «На рассмотрении» и воронки «интересные»).
+// analyze=true + дноуглубительное название → после успешной загрузки файлов
+// запускается первичный анализ ТЗ через Kimi.
+func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName string, analyze bool, res *fileRunResult) {
+	number := bitableText(rec.Fields["Номер"])
+	needAnalysis := analyze && tenderName != "" && dredgeRe.MatchString(tenderName) &&
+		bitableText(rec.Fields["Анализ ТЗ"]) == ""
+
+	// клиентская перестраховка: пропускаем, если файлы уже есть или чекбокс отмечен
+	if done, _ := rec.Fields["ФайлыЗагружены"].(bool); done {
+		// файлы уже загружены — остаётся только анализ ТЗ (если нужен)
+		if needAnalysis {
+			if err := runTZAnalysis(ctx, rec, nil); err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("%s: [анализ] %v", number, err))
+			} else {
+				res.TZAnalyses++
+			}
+		}
+		return
+	}
+	if atts, ok := rec.Fields["Файлы"].([]any); ok && len(atts) > 0 {
+		return
+	}
+	tenderID := bitableText(rec.Fields["TenderplanID"])
+	if tenderID == "" {
+		res.Errors = append(res.Errors, number+": пустой TenderplanID")
+		return
+	}
+
+	atts, err := fetchAttachments(ctx, tenderID)
+	if err != nil {
+		res.Errors = append(res.Errors, number+": attachments "+err.Error())
+		return
+	}
+	if len(atts) == 0 {
+		log.Printf("[files] %s (%s): файлов нет — отмечаем ФайлыЗагружены", number, tenderID)
+		if err := updateRecordFiles(ctx, rec.RecordID, nil); err != nil {
+			res.Errors = append(res.Errors, number+": mark-empty "+err.Error())
+			return
+		}
+		res.RecordsDone++
+		if needAnalysis {
+			// вложений нет — зафиксируем это в поле «Анализ ТЗ», чтобы не возвращаться
+			if err := runTZAnalysis(ctx, rec, nil); err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("%s: [анализ] %v", number, err))
+			} else {
+				res.TZAnalyses++
+			}
+		}
+		return
+	}
+
+	// файлы-кандидаты на анализ ТЗ — их временные копии не удаляем сразу после загрузки
+	candHrefs := map[string]bool{}
+	if needAnalysis {
+		for _, c := range pickTZCandidates(atts) {
+			candHrefs[c.Href] = true
+		}
+	}
+
+	var tokens []string
+	var kept []dlFile
+	defer func() {
+		for _, f := range kept {
+			os.Remove(f.path) // временные файлы-кандидаты больше не нужны
+		}
+	}()
+	for _, att := range atts {
+		name := sanitizeFileName(att.RealName)
+		if att.RealName == "" {
+			name = sanitizeFileName(att.DisplayName)
+		}
+		path, size, err := downloadAttachment(ctx, att)
+		if err != nil {
+			res.FilesFailed++
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: %s download: %v", number, name, err))
+			log.Printf("[files] %s: %s — ошибка скачивания: %v", number, name, err)
+			continue
+		}
+		res.FilesDownloaded++
+		token, err := uploadFileToDrive(ctx, path, name, size)
+		if err != nil {
+			os.Remove(path)
+			res.FilesFailed++
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: %s upload: %v", number, name, err))
+			log.Printf("[files] %s: %s (%d bytes) — ошибка загрузки в Lark: %v", number, name, size, err)
+			continue
+		}
+		res.FilesUploaded++
+		tokens = append(tokens, token)
+		log.Printf("[files] %s: %s (%d bytes) — загружен, file_token=%s", number, name, size, token)
+		if needAnalysis && candHrefs[att.Href] && size <= maxAnalysisFileSize {
+			kept = append(kept, dlFile{att: att, path: path, name: name, size: size})
+		} else {
+			os.Remove(path) // временный файл больше не нужен
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if len(tokens) == 0 {
+		return // все файлы упали — карточку не трогаем, повторим в следующем проходе
+	}
+	if err := updateRecordFiles(ctx, rec.RecordID, tokens); err != nil {
+		res.Errors = append(res.Errors, number+": update record "+err.Error())
+		return
+	}
+	res.RecordsDone++
+	log.Printf("[files] %s: карточка обновлена, файлов: %d", number, len(tokens))
+
+	// первичный анализ ТЗ (только дноуглубительные из воронки «интересные»)
+	if needAnalysis {
+		if err := runTZAnalysis(ctx, rec, kept); err != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: [анализ] %v", number, err))
+		} else {
+			res.TZAnalyses++
+		}
+	}
 }
 
 // scheduleFileDownloads — периодический опрос каждые filesPollInterval.
@@ -1153,6 +1340,812 @@ func scheduleFileDownloads(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// ===== TENDERPLAN MARKS (воронка «интересные») =====
+// Опрос подписки Tenderplan v1 (/api/tenders/getlist): тендеры с меткой, чьё имя
+// матчится (?i)интерес, попадают в воронку «интересные» + принудительный файловый пайплайн.
+
+// tpSubTender — модель тендера подписки из v1 /api/tenders/getlist (+ поле marks).
+type tpSubTender struct {
+	tpShortTender
+	Marks []json.RawMessage `json:"marks"` // массив ObjectId меток (строки или объекты)
+}
+
+// markIDs извлекает ObjectId меток (терпимо к формату: строка / {"_id":...} / {"$oid":...}).
+func (s *tpSubTender) markIDs() []string {
+	var ids []string
+	for _, raw := range s.Marks {
+		var id string
+		if err := json.Unmarshal(raw, &id); err == nil && id != "" {
+			ids = append(ids, id)
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(raw, &obj); err == nil {
+			for _, k := range []string{"_id", "id", "$oid"} {
+				if v, ok := obj[k].(string); ok && v != "" {
+					ids = append(ids, v)
+					break
+				}
+			}
+		}
+	}
+	return ids
+}
+
+// tenderFromSub конвертирует модель подписки во внутреннюю модель Tender.
+func tenderFromSub(s *tpSubTender) Tender {
+	t := Tender{
+		ID:       s.ID,
+		Number:   s.Number,
+		Name:     s.OrderName,
+		Region:   rawToString(s.Region),
+		Title:    s.OrderName,
+		Deadline: msToRFC3339(s.SubmissionCloseDateTime),
+		URL:      s.Href,
+	}
+	if s.MaxPrice != nil {
+		t.Amount = *s.MaxPrice
+	}
+	if len(s.Customers) > 0 {
+		t.Customer = s.Customers[0].Name
+		if t.Region == "" {
+			t.Region = strconv.Itoa(s.Customers[0].Region)
+		}
+	}
+	return t
+}
+
+// fetchSubscriptionPage — одна страница v1 getlist (50/стр., тот же Bearer-ключ).
+func fetchSubscriptionPage(ctx context.Context, page int) ([]tpSubTender, error) {
+	var raw json.RawMessage
+	u := fmt.Sprintf("%s/tenders/getlist?page=%d", tenderplanAPI, page)
+	if err := tpGet(ctx, u, &raw); err != nil {
+		return nil, err
+	}
+	// форматы ответа: {"tenders":[...]} / {"data":[...]} / {"items":[...]} / сразу массив
+	var wrap map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &wrap); err == nil {
+		for _, key := range []string{"tenders", "data", "items"} {
+			if arr, ok := wrap[key]; ok {
+				var out []tpSubTender
+				if err := json.Unmarshal(arr, &out); err == nil {
+					return out, nil
+				}
+			}
+		}
+	}
+	var out []tpSubTender
+	if err := json.Unmarshal(raw, &out); err == nil {
+		return out, nil
+	}
+	return nil, fmt.Errorf("getlist v1: неизвестный формат ответа: %.200s", string(raw))
+}
+
+// markNameCache — кэш имён меток Tenderplan (map+mutex).
+var markNameCache = struct {
+	sync.Mutex
+	m map[string]string
+}{m: map[string]string{}}
+
+// resolveMarkName резолвит имя метки по ObjectId: GET /api/marks/get?id=<ObjectId> (с кэшем).
+func resolveMarkName(ctx context.Context, id string) (string, error) {
+	markNameCache.Lock()
+	if v, ok := markNameCache.m[id]; ok {
+		markNameCache.Unlock()
+		return v, nil
+	}
+	markNameCache.Unlock()
+	var raw json.RawMessage
+	if err := tpGet(ctx, tenderplanAPI+"/marks/get?id="+url.QueryEscape(id), &raw); err != nil {
+		return "", err
+	}
+	var out struct {
+		Name string `json:"name"`
+		Mark *struct {
+			Name string `json:"name"`
+		} `json:"mark"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", err
+	}
+	name := out.Name
+	if name == "" && out.Mark != nil {
+		name = out.Mark.Name
+	}
+	markNameCache.Lock()
+	markNameCache.m[id] = name
+	markNameCache.Unlock()
+	return name, nil
+}
+
+// hasInterestingMark проверяет, есть ли у тендера метка с именем (?i)интерес.
+func hasInterestingMark(ctx context.Context, s *tpSubTender) bool {
+	for _, mid := range s.markIDs() {
+		name, err := resolveMarkName(ctx, mid)
+		if err != nil {
+			log.Printf("[метки] marks/get %s: %v", mid, err)
+			continue
+		}
+		if interestingMarkRe.MatchString(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordSearchFields — поля, нужные файловому пайплайну/воронкам при поиске записи.
+var recordSearchFields = []string{"Номер", "TenderplanID", "Файлы", "ФайлыЗагружены", "Воронка", "Анализ ТЗ"}
+
+// findRecordByTenderplanID — поиск записи по полю TenderplanID (nil, nil — не найдено).
+func findRecordByTenderplanID(ctx context.Context, id string) (*bitableRecord, error) {
+	cond := []map[string]any{
+		{"field_name": "TenderplanID", "operator": "is", "value": []string{id}},
+	}
+	recs, err := bitableSearch(ctx, cond, recordSearchFields)
+	if err != nil {
+		// возможно, каких-то опциональных полей ещё нет — повторяем с базовым набором
+		recs, err = bitableSearch(ctx, cond, []string{"Номер", "TenderplanID", "Файлы", "ФайлыЗагружены"})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(recs) == 0 {
+		return nil, nil
+	}
+	return &recs[0], nil
+}
+
+// findRecordByNumberFull — поиск записи по полю «Номер» (fallback, когда нет поля TenderplanID).
+func findRecordByNumberFull(ctx context.Context, number string) (*bitableRecord, error) {
+	recs, err := bitableSearch(ctx, []map[string]any{
+		{"field_name": "Номер", "operator": "is", "value": []string{number}},
+	}, []string{"Номер", "TenderplanID", "Файлы", "ФайлыЗагружены"})
+	if err != nil {
+		return nil, err
+	}
+	if len(recs) == 0 {
+		return nil, nil
+	}
+	return &recs[0], nil
+}
+
+// interestingItem — строка отчёта по интересному тендеру (название + статус обработки).
+type interestingItem struct {
+	Name   string `json:"name"`
+	Number string `json:"number,omitempty"`
+	Status string `json:"status"`
+}
+
+// marksResult — итоги одного прохода опроса меток.
+type marksResult struct {
+	Checked     int      `json:"checked"`
+	Interesting int      `json:"interesting"`
+	Created     int      `json:"created"`
+	Updated     int      `json:"updated"`
+	Errors      []string `json:"errors,omitempty"`
+}
+
+var marksRunMu sync.Mutex // защита от параллельных запусков опроса меток
+
+// processMarkedTenders — опрос меток Tenderplan: тендеры с меткой «интерес...»
+// заводятся/обновляются в воронку «интересные» + принудительный запуск файлов и анализа ТЗ.
+// Ошибки API собираются в res.Errors и логируются, цикл не роняют.
+func processMarkedTenders(ctx context.Context) marksResult {
+	if !marksRunMu.TryLock() {
+		log.Printf("[метки] предыдущий опрос меток ещё идёт — пропуск")
+		return marksResult{Errors: []string{"previous marks poll still running"}}
+	}
+	defer marksRunMu.Unlock()
+
+	res := marksResult{}
+	var items []interestingItem
+	defer func() { reportMarks(res.Interesting, items, res.Errors) }()
+
+	ensureAnalysisFieldsOnce(ctx)
+
+	// 1. собираем интересные тендеры подписки (пагинация v1 getlist)
+	seen := map[string]bool{}
+	var interesting []tpSubTender
+	for page := 0; page < marksMaxPages; page++ {
+		subs, err := fetchSubscriptionPage(ctx, page)
+		if err != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("getlist page=%d: %v", page, err))
+			break
+		}
+		if len(subs) == 0 {
+			break
+		}
+		for i := range subs {
+			s := &subs[i]
+			res.Checked++
+			if s.ID == "" || seen[s.ID] {
+				continue
+			}
+			seen[s.ID] = true
+			if len(s.Marks) == 0 || !hasInterestingMark(ctx, s) {
+				continue
+			}
+			interesting = append(interesting, *s)
+		}
+		if len(subs) < 50 { // последняя страница
+			break
+		}
+	}
+	res.Interesting = len(interesting)
+	log.Printf("[метки] проверено тендеров подписки: %d, интересных: %d", res.Checked, res.Interesting)
+
+	// 2. обрабатываем каждый интересный тендер
+	for i := range interesting {
+		s := &interesting[i]
+		item := interestingItem{Name: s.OrderName, Number: s.Number}
+		rec, err := findRecordByTenderplanID(ctx, s.ID)
+		if err != nil {
+			var le *larkError
+			if asLarkError(err, &le) && isFieldNotFound(le.Code, le.Msg) {
+				log.Printf("[метки] поле TenderplanID отсутствует (%s), fallback на поиск по номеру", le.Msg)
+				rec, err = findRecordByNumberFull(ctx, s.Number)
+			}
+		}
+		if err != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: bitable search: %v", s.Number, err))
+			item.Status = "ошибка поиска в Bitable: " + err.Error()
+			items = append(items, item)
+			continue
+		}
+
+		if rec == nil {
+			// записи нет — догружаем полную карточку и создаём (Kimi-резюме опционально)
+			t := tenderFromSub(s)
+			if d, derr := fetchTenderDetails(ctx, s.ID); derr == nil {
+				if t.URL == "" {
+					t.URL = d.Href
+				}
+				if d.OrderName != "" {
+					t.Name = d.OrderName
+					t.Title = d.OrderName
+				}
+				t.Description = d.Description
+				if t.Description == "" {
+					t.Description = d.NoticeDescription
+				}
+			} else {
+				log.Printf("[метки] полная карточка %s: %v", s.ID, derr)
+			}
+			summary, kerr := kimiSummarize(ctx, t)
+			if kerr != nil {
+				log.Printf("[метки] kimi %s: %v", s.Number, kerr)
+				res.Errors = append(res.Errors, s.Number+": kimi "+kerr.Error())
+				summary = "⚠️ Резюме недоступно: ошибка Kimi API (см. логи). Данные тендера — в полях карточки."
+			}
+			r, err := addToBitable(ctx, t, classifyCluster(t), summary, "интересные")
+			if err != nil {
+				res.Errors = append(res.Errors, s.Number+": bitable "+err.Error())
+				item.Status = "ошибка создания записи: " + err.Error()
+				items = append(items, item)
+				continue
+			}
+			if r.Status == "duplicate" {
+				item.Status = "дубль по номеру — запись уже существовала"
+				items = append(items, item)
+				continue
+			}
+			res.Created++
+			recID := recordIDFromCreate(r.Record)
+			rec = &bitableRecord{RecordID: recID, Fields: map[string]any{
+				"Номер": s.Number, "TenderplanID": s.ID, "Воронка": "интересные",
+			}}
+			item.Status = "создана запись, воронка «интересные»"
+			log.Printf("[воронки] %s: создана запись (воронка «интересные»), record=%s", s.Number, recID)
+		} else {
+			// запись уже есть — обновляем воронку на «интересные», не дублируя запись
+			if bitableText(rec.Fields["Воронка"]) != "интересные" {
+				if err := putRecord(ctx, rec.RecordID, map[string]any{"Воронка": "интересные"}); err != nil {
+					res.Errors = append(res.Errors, s.Number+": update voronka "+err.Error())
+					item.Status = "запись есть, ошибка обновления воронки: " + err.Error()
+					items = append(items, item)
+					continue
+				}
+				res.Updated++
+				item.Status = "запись уже была — воронка обновлена на «интересные»"
+				log.Printf("[воронки] %s: воронка обновлена на «интересные», record=%s", s.Number, rec.RecordID)
+			} else {
+				item.Status = "уже в воронке «интересные»"
+			}
+		}
+
+		// принудительное скачивание файлов (+ анализ ТЗ для дноуглубительных)
+		if rec.RecordID == "" {
+			items = append(items, item)
+			continue
+		}
+		if done, _ := rec.Fields["ФайлыЗагружены"].(bool); done {
+			// файлы уже загружены — при необходимости только анализ ТЗ
+			if dredgeRe.MatchString(s.OrderName) && bitableText(rec.Fields["Анализ ТЗ"]) == "" {
+				if err := runTZAnalysis(ctx, *rec, nil); err != nil {
+					res.Errors = append(res.Errors, fmt.Sprintf("%s: [анализ] %v", s.Number, err))
+					item.Status += "; анализ ТЗ: " + err.Error()
+				} else {
+					item.Status += "; анализ ТЗ выполнен"
+				}
+			}
+			items = append(items, item)
+			continue
+		}
+		if !filesRunMu.TryLock() {
+			// плановый файловый пайплайн идёт прямо сейчас — он подхватит карточку сам
+			log.Printf("[метки] %s: файловый пайплайн занят — файлы подхватит плановый проход", s.Number)
+			item.Status += "; файлы — в плановом проходе пайплайна"
+			items = append(items, item)
+			continue
+		}
+		fres := fileRunResult{StartedAt: time.Now().Format(time.RFC3339)}
+		processRecordFiles(ctx, *rec, s.OrderName, true, &fres)
+		fres.FinishedAt = time.Now().Format(time.RFC3339)
+		filesRunMu.Unlock()
+		res.Errors = append(res.Errors, fres.Errors...)
+		switch {
+		case fres.RecordsDone > 0 && fres.TZAnalyses > 0:
+			item.Status += "; файлы загружены, анализ ТЗ выполнен"
+		case fres.RecordsDone > 0:
+			item.Status += "; файлы загружены"
+		default:
+			item.Status += "; файлы не обработаны (см. ошибки)"
+		}
+		items = append(items, item)
+	}
+	return res
+}
+
+// scheduleMarksPoll — периодический опрос меток Tenderplan каждые marksPollInterval.
+func scheduleMarksPoll(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(marksPollInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				log.Printf("[метки] плановый опрос меток Tenderplan")
+				res := processMarkedTenders(ctx)
+				log.Printf("[метки] done: checked=%d interesting=%d created=%d updated=%d errors=%d",
+					res.Checked, res.Interesting, res.Created, res.Updated, len(res.Errors))
+			}
+		}
+	}()
+}
+
+// ===== АНАЛИЗ ТЗ (KIMI FILES API) =====
+// Первичный анализ ТЗ дноуглубительных тендеров из воронки «интересные».
+
+// ensureAnalysisFieldsOnce создаёт новые поля Bitable (Воронка + поля анализа ТЗ) один раз за процесс.
+var analysisFieldsOnce sync.Once
+
+func ensureAnalysisFieldsOnce(ctx context.Context) {
+	analysisFieldsOnce.Do(func() {
+		for _, fn := range []string{"Воронка", "Анализ ТЗ", "Объём грунта", "Отвал: расстояние", "Техника", "Стоимость 1 м³"} {
+			_ = ensureBitableField(ctx, fn, 1) // ошибки (в т.ч. «уже существует») логируются внутри
+		}
+	})
+}
+
+// tenderNameCache — кэш названий тендеров (для проверки «дноуглубительный» в файловом пайплайне).
+var tenderNameCache = struct {
+	sync.Mutex
+	m map[string]string
+}{m: map[string]string{}}
+
+// resolveTenderName возвращает название тендера по TenderplanID (с кэшем; при ошибке — пустую строку).
+func resolveTenderName(ctx context.Context, id string) string {
+	if id == "" {
+		return ""
+	}
+	tenderNameCache.Lock()
+	if v, ok := tenderNameCache.m[id]; ok {
+		tenderNameCache.Unlock()
+		return v
+	}
+	tenderNameCache.Unlock()
+	d, err := fetchTenderDetails(ctx, id)
+	if err != nil {
+		log.Printf("[анализ] название тендера %s: %v", id, err)
+		return "" // ошибки не кэшируем — повторим в следующем проходе
+	}
+	tenderNameCache.Lock()
+	tenderNameCache.m[id] = d.OrderName
+	tenderNameCache.Unlock()
+	return d.OrderName
+}
+
+// pickTZCandidates выбирает файлы для анализа ТЗ: сначала имена с «тз/техническ/задание»,
+// иначе — до 3 первых документов. Файлы >50 МБ пропускаются (если размер известен).
+func pickTZCandidates(atts []tpAttachment) []tpAttachment {
+	var tz, rest []tpAttachment
+	for _, a := range atts {
+		if a.Size > maxAnalysisFileSize {
+			continue
+		}
+		name := a.RealName
+		if name == "" {
+			name = a.DisplayName
+		}
+		if tzFileRe.MatchString(name) {
+			tz = append(tz, a)
+		} else {
+			rest = append(rest, a)
+		}
+	}
+	src := tz
+	if len(src) == 0 {
+		src = rest
+	}
+	if len(src) > 3 {
+		src = src[:3]
+	}
+	return src
+}
+
+// analysisAttempts — защита от повторных прогонов Kimi по одной записи (ошибки API, цикл каждые 5 мин).
+var analysisAttempts = struct {
+	sync.Mutex
+	m map[string]time.Time
+}{m: map[string]time.Time{}}
+
+// markAnalysisAttempt фиксирует попытку анализа; false — если попытка была < analysisRetryDelay назад.
+func markAnalysisAttempt(recordID string) bool {
+	analysisAttempts.Lock()
+	defer analysisAttempts.Unlock()
+	if ts, ok := analysisAttempts.m[recordID]; ok && time.Since(ts) < analysisRetryDelay {
+		return false
+	}
+	analysisAttempts.m[recordID] = time.Now()
+	return true
+}
+
+// runTZAnalysis — первичный анализ ТЗ дноуглубительного тендера через Kimi Files API.
+// local — уже скачанные файлы-кандидаты (nil → выбрать и скачать самостоятельно по TenderplanID).
+// Результат пишется в поля «Анализ ТЗ», «Объём грунта», «Отвал: расстояние», «Техника», «Стоимость 1 м³».
+func runTZAnalysis(ctx context.Context, rec bitableRecord, local []dlFile) error {
+	number := bitableText(rec.Fields["Номер"])
+	if !markAnalysisAttempt(rec.RecordID) {
+		return fmt.Errorf("повторная попытка раньше чем через %s — пропуск", analysisRetryDelay)
+	}
+	if local == nil {
+		tenderID := bitableText(rec.Fields["TenderplanID"])
+		if tenderID == "" {
+			return fmt.Errorf("пустой TenderplanID — нечего анализировать")
+		}
+		atts, err := fetchAttachments(ctx, tenderID)
+		if err != nil {
+			return fmt.Errorf("attachments: %w", err)
+		}
+		cands := pickTZCandidates(atts)
+		if len(cands) == 0 {
+			log.Printf("[анализ] %s: нет файлов ТЗ для анализа — фиксируем пометку", number)
+			return writeAnalysisNote(ctx, rec.RecordID,
+				"Файлы ТЗ во вложениях тендера не найдены (или все >50 МБ) — первичный анализ невозможен.")
+		}
+		var downloaded []dlFile
+		defer func() {
+			for _, f := range downloaded {
+				os.Remove(f.path)
+			}
+		}()
+		for _, att := range cands {
+			name := sanitizeFileName(att.RealName)
+			if att.RealName == "" {
+				name = sanitizeFileName(att.DisplayName)
+			}
+			path, size, err := downloadAttachment(ctx, att)
+			if err != nil {
+				log.Printf("[анализ] %s: %s — ошибка скачивания: %v", number, name, err)
+				continue
+			}
+			if size > maxAnalysisFileSize {
+				log.Printf("[анализ] %s: %s (%d bytes) > 50 МБ — пропуск", number, name, size)
+				os.Remove(path)
+				continue
+			}
+			downloaded = append(downloaded, dlFile{att: att, path: path, name: name, size: size})
+		}
+		local = downloaded
+	}
+	if len(local) == 0 {
+		return fmt.Errorf("файлы ТЗ не скачаны — анализ отложен")
+	}
+
+	// извлекаем текст первого файла, с которым справилась Kimi
+	var tzText, usedFile string
+	for _, f := range local {
+		fileID, err := kimiUploadFile(ctx, f.path, f.name)
+		if err != nil {
+			log.Printf("[анализ] %s: загрузка %s в Kimi: %v", number, f.name, err)
+			continue
+		}
+		content, err := kimiFileContent(ctx, fileID)
+		if err != nil {
+			log.Printf("[анализ] %s: контент %s из Kimi: %v", number, f.name, err)
+			continue
+		}
+		if strings.TrimSpace(content) == "" {
+			log.Printf("[анализ] %s: %s — Kimi вернула пустой текст, пробуем следующий файл", number, f.name)
+			continue
+		}
+		tzText, usedFile = content, f.name
+		break
+	}
+	if tzText == "" {
+		return fmt.Errorf("Kimi не смогла извлечь текст ни из одного файла ТЗ")
+	}
+	log.Printf("[анализ] %s: текст ТЗ извлечён из %q (%d знаков), запускаем Kimi-анализ", number, usedFile, len([]rune(tzText)))
+
+	vals, full, err := kimiAnalyzeTZ(ctx, tzText)
+	if err != nil {
+		return err
+	}
+	if err := writeAnalysisFields(ctx, rec.RecordID, vals, full); err != nil {
+		return err
+	}
+	log.Printf("[анализ] %s: анализ ТЗ записан в карточку (файл %q)", number, usedFile)
+	return nil
+}
+
+// kimiUploadFile загружает файл в Kimi Files API (multipart, purpose=file-extract) и возвращает file id.
+func kimiUploadFile(ctx context.Context, localPath, fileName string) (string, error) {
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		var werr error
+		defer func() {
+			if werr != nil {
+				_ = pw.CloseWithError(werr)
+			} else {
+				_ = pw.Close()
+			}
+		}()
+		if werr = mw.WriteField("purpose", "file-extract"); werr != nil {
+			return
+		}
+		var part io.Writer
+		if part, werr = mw.CreateFormFile("file", fileName); werr != nil {
+			return
+		}
+		var f *os.File
+		if f, werr = os.Open(localPath); werr != nil {
+			return
+		}
+		defer f.Close()
+		if _, werr = io.Copy(part, f); werr != nil {
+			return
+		}
+		werr = mw.Close()
+	}()
+
+	req, _ := http.NewRequestWithContext(ctx, "POST", kimiFilesAPI, pr)
+	req.Header.Set("Authorization", "Bearer "+kimiKey)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := kimiClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var out struct {
+		ID    string `json:"id"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("kimi files: bad json: %.200s", string(body))
+	}
+	if out.Error != nil {
+		return "", fmt.Errorf("kimi files: %s", out.Error.Message)
+	}
+	if resp.StatusCode != http.StatusOK || out.ID == "" {
+		return "", fmt.Errorf("kimi files HTTP %d: %.200s", resp.StatusCode, string(body))
+	}
+	return out.ID, nil
+}
+
+// kimiFileContent возвращает извлечённый текст файла (GET /v1/files/{id}/content).
+func kimiFileContent(ctx context.Context, fileID string) (string, error) {
+	req, _ := http.NewRequestWithContext(ctx, "GET", kimiFilesAPI+"/"+fileID+"/content", nil)
+	req.Header.Set("Authorization", "Bearer "+kimiKey)
+	resp, err := kimiClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("kimi file content HTTP %d: %.200s", resp.StatusCode, string(body))
+	}
+	// обычно ответ — JSON {"content": "...", ...}; на всякий случай принимаем и сырой текст
+	var out struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(body, &out); err == nil && out.Content != "" {
+		return out.Content, nil
+	}
+	return string(body), nil
+}
+
+// tzAnalysisValues — структурированный результат анализа ТЗ (просим у Kimi строгий JSON).
+type tzAnalysisValues struct {
+	Obem    string `json:"obem"`
+	Otval   string `json:"otval"`
+	Tehnika string `json:"tehnika"`
+	CenaM3  string `json:"cena_m3"`
+	Komment string `json:"komment"`
+}
+
+// kimiAnalyzeTZ прогоняет текст ТЗ через Kimi: system = содержимое ТЗ, user = инструкция
+// извлечь 4 пункта и вернуть JSON. Возвращает извлечённые значения + полный текст ответа.
+func kimiAnalyzeTZ(ctx context.Context, tzText string) (tzAnalysisValues, string, error) {
+	var vals tzAnalysisValues
+	const maxSystemRunes = 120000 // защита от переполнения контекста на очень больших ТЗ
+	if r := []rune(tzText); len(r) > maxSystemRunes {
+		tzText = string(r[:maxSystemRunes])
+		log.Printf("[анализ] текст ТЗ обрезан до %d знаков (было %d)", maxSystemRunes, len(r))
+	}
+	prompt := `Это техническое задание (ТЗ) дноуглубительных работ. Извлеки из него ровно 4 пункта:
+1) obem — объём грунта выемки/отсыпки (м³);
+2) otval — расстояние от места производства работ до отвала;
+3) tehnika — необходимая техника;
+4) cena_m3 — стоимость 1 м³ вынутого и перемещённого грунта; если цены в ТЗ нет — оцени как НМЦ/объём и ЯВНО пометь «оценка»;
+5) komment — краткий комментарий (1-2 предложения).
+Если каких-то данных нет — напиши «не указано в ТЗ».
+Ответ краткий, по-русски, структурированный. Ответь СТРОГО одним JSON-объектом без пояснений и markdown:
+{"obem":"...","otval":"...","tehnika":"...","cena_m3":"...","komment":"..."}`
+	body, _ := json.Marshal(map[string]any{
+		"model": kimiModel,
+		"messages": []map[string]string{
+			{"role": "system", "content": tzText},
+			{"role": "user", "content": prompt},
+		},
+		// reasoning-модель съедает токены на «размышления» — нужен запас (см. kimiSummarize);
+		// temperature НЕ передаём: kimi-k2.6 принимает только temperature=1.
+		"max_tokens": 4096,
+	})
+	req, _ := http.NewRequestWithContext(ctx, "POST", kimiAPI, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+kimiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := kimiClient.Do(req)
+	if err != nil {
+		return vals, "", err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return vals, "", err
+	}
+	if len(out.Choices) == 0 || out.Choices[0].Message.Content == "" {
+		return vals, "", fmt.Errorf("kimi: empty response")
+	}
+	full := strings.TrimSpace(out.Choices[0].Message.Content)
+	// парсим JSON из ответа (модель может обернуть его в ```json ... ```);
+	// при ошибке парсинга полный текст всё равно уйдёт в поле «Анализ ТЗ».
+	if i, j := strings.Index(full, "{"), strings.LastIndex(full, "}"); i >= 0 && j > i {
+		if err := json.Unmarshal([]byte(full[i:j+1]), &vals); err != nil {
+			log.Printf("[анализ] не удалось распарсить JSON из ответа Kimi: %v — пишем весь текст в «Анализ ТЗ»", err)
+		}
+	}
+	return vals, full, nil
+}
+
+// writeAnalysisFields пишет результат анализа в карточку с самолечением «поле не существует».
+func writeAnalysisFields(ctx context.Context, recordID string, vals tzAnalysisValues, full string) error {
+	fields := map[string]any{"Анализ ТЗ": full}
+	if vals.Obem != "" {
+		fields["Объём грунта"] = vals.Obem
+	}
+	if vals.Otval != "" {
+		fields["Отвал: расстояние"] = vals.Otval
+	}
+	if vals.Tehnika != "" {
+		fields["Техника"] = vals.Tehnika
+	}
+	if vals.CenaM3 != "" {
+		fields["Стоимость 1 м³"] = vals.CenaM3
+	}
+	err := putRecord(ctx, recordID, fields)
+	if err == nil {
+		return nil
+	}
+	var le *larkError
+	if !asLarkError(err, &le) || !isFieldNotFound(le.Code, le.Msg) {
+		return err
+	}
+	log.Printf("[анализ] поле не найдено (%s), создаём и повторяем", le.Msg)
+	for _, fn := range []string{"Анализ ТЗ", "Объём грунта", "Отвал: расстояние", "Техника", "Стоимость 1 м³"} {
+		_ = ensureBitableField(ctx, fn, 1)
+	}
+	if err = putRecord(ctx, recordID, fields); err == nil {
+		return nil
+	}
+	// fallback: хотя бы полный текст анализа
+	return putRecord(ctx, recordID, map[string]any{"Анализ ТЗ": full})
+}
+
+// writeAnalysisNote фиксирует служебную пометку в поле «Анализ ТЗ» (чтобы не анализировать повторно).
+func writeAnalysisNote(ctx context.Context, recordID, note string) error {
+	if err := putRecord(ctx, recordID, map[string]any{"Анализ ТЗ": note}); err != nil {
+		var le *larkError
+		if asLarkError(err, &le) && isFieldNotFound(le.Code, le.Msg) {
+			_ = ensureBitableField(ctx, "Анализ ТЗ", 1)
+			return putRecord(ctx, recordID, map[string]any{"Анализ ТЗ": note})
+		}
+		return err
+	}
+	return nil
+}
+
+// ===== REPORT (GET /report) =====
+// In-memory состояние последних прогонов: ежедневный сбор, метки, файлы, анализ ТЗ.
+
+type reportData struct {
+	Time             string            `json:"time"`
+	NewAdded         int               `json:"new_added"`         // новых добавлено (последний ежедневный сбор)
+	InterestingFound int               `json:"interesting_found"` // интересных найдено (последний опрос меток)
+	FilesDownloaded  int               `json:"files_downloaded"`  // файлов скачано (последний проход пайплайна)
+	TZAnalyses       int               `json:"tz_analyses"`       // анализов ТЗ сделано (последний проход пайплайна)
+	Errors           []string          `json:"errors"`            // ошибки всех подсистем одним списком
+	Interesting      []interestingItem `json:"interesting,omitempty"`
+}
+
+var report = struct {
+	sync.Mutex
+	data                            reportData
+	dailyErrs, marksErrs, filesErrs []string
+}{data: reportData{Errors: []string{}}}
+
+// reportDaily фиксирует итоги ежедневного сбора (новые → воронка «новые от ...»).
+func reportDaily(res runResults) {
+	report.Lock()
+	defer report.Unlock()
+	report.data.Time = time.Now().Format(time.RFC3339)
+	report.data.NewAdded = res.Added
+	report.dailyErrs = res.Errors
+}
+
+// reportMarks фиксирует итоги опроса меток Tenderplan (воронка «интересные»).
+func reportMarks(found int, items []interestingItem, errs []string) {
+	report.Lock()
+	defer report.Unlock()
+	report.data.Time = time.Now().Format(time.RFC3339)
+	report.data.InterestingFound = found
+	report.data.Interesting = items
+	report.marksErrs = errs
+}
+
+// reportFiles фиксирует итоги последнего прохода файлового пайплайна.
+func reportFiles(res fileRunResult) {
+	report.Lock()
+	defer report.Unlock()
+	report.data.Time = time.Now().Format(time.RFC3339)
+	report.data.FilesDownloaded = res.FilesDownloaded
+	report.data.TZAnalyses = res.TZAnalyses
+	report.filesErrs = res.Errors
+}
+
+// reportSnapshot — снимок состояния для GET /report (ошибки всех подсистем — одним списком).
+func reportSnapshot() reportData {
+	report.Lock()
+	defer report.Unlock()
+	out := report.data
+	out.Errors = append([]string{}, report.dailyErrs...)
+	out.Errors = append(out.Errors, report.marksErrs...)
+	out.Errors = append(out.Errors, report.filesErrs...)
+	return out
 }
 
 // ===== HMAC VERIFY =====
@@ -1201,10 +2194,21 @@ func (h *server) handleRun(w http.ResponseWriter, r *http.Request) {
 		defer monitorRunMu.Unlock()
 		log.Printf("[run] старт полного цикла мониторинга")
 		res := processTenders(context.Background())
+		reportDaily(res)
 		log.Printf("[run] done: processed=%d added=%d duplicates=%d errors=%d %v",
 			res.Processed, res.Added, res.Duplicates, len(res.Errors), res.Errors)
 	}()
 	writeJSON(w, 202, map[string]string{"status": "started", "hint": "смотрите логи контейнера: [run] done: ..."})
+}
+
+// handleReport — GET /report: состояние последних прогонов
+// (ежедневный сбор, метки/воронки, файловый пайплайн, анализ ТЗ).
+func (h *server) handleReport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, 200, reportSnapshot())
 }
 
 // handleFilesRun — ручной запуск файлового пайплайна: POST /files/run.
@@ -1293,6 +2297,7 @@ func scheduleDaily(ctx context.Context) {
 			case <-t.C:
 				log.Printf("[scheduler] running daily job")
 				res := processTenders(ctx)
+				reportDaily(res)
 				log.Printf("[scheduler] done: processed=%d added=%d duplicates=%d errors=%d",
 					res.Processed, res.Added, res.Duplicates, len(res.Errors))
 			}
@@ -1318,6 +2323,7 @@ func main() {
 	defer cancel()
 	scheduleDaily(rootCtx)
 	scheduleFileDownloads(rootCtx)
+	scheduleMarksPoll(rootCtx)
 
 	mux := http.NewServeMux()
 	h := &server{}
@@ -1326,6 +2332,7 @@ func main() {
 	mux.HandleFunc("/files/run", h.handleFilesRun)
 	mux.HandleFunc("/webhook/mail-tenders", h.handleMailTenders)
 	mux.HandleFunc("/tenders", h.handleListTenders)
+	mux.HandleFunc("/report", h.handleReport)
 
 	srv := &http.Server{
 		Addr:              listenAddr,
