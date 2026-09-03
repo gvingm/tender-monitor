@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/adler32"
 	"io"
 	"log"
 	"mime/multipart"
@@ -1013,9 +1014,17 @@ func downloadToTemp(ctx context.Context, u string, bearer bool) (int, string, in
 	return resp.StatusCode, tmp.Name(), size, nil
 }
 
+// uploadAllMaxSize — лимит API medias/upload_all (20 МБ); большие файлы грузим по частям.
+const uploadAllMaxSize = 20 * 1024 * 1024
+
 // uploadFileToDrive загружает локальный файл в Lark Drive (bitable_file) и возвращает file_token.
 // Потоковая multipart-отправка через io.Pipe — файл не читается в память целиком.
+// Файлы >20 МБ идут через multipart upload API (upload_prepare/part/finish).
 func uploadFileToDrive(ctx context.Context, localPath, fileName string, size int64) (string, error) {
+	if size > uploadAllMaxSize {
+		log.Printf("[files] %s (%d bytes) > 20 МБ — загружаем по частям (multipart upload)", fileName, size)
+		return uploadFileToDriveMultipart(ctx, localPath, fileName, size)
+	}
 	token, err := getTenantToken(ctx)
 	if err != nil {
 		return "", err
@@ -1081,6 +1090,131 @@ func uploadFileToDrive(ctx context.Context, localPath, fileName string, size int
 		return "", fmt.Errorf("upload_all code=%d msg=%s", out.Code, out.Msg)
 	}
 	return out.Data.FileToken, nil
+}
+
+// uploadFileToDriveMultipart загружает файл >20 МБ в Lark Drive (bitable_file) по частям:
+// upload_prepare → upload_part (блоки последовательно, seq с 0) → upload_finish.
+// Файл читается блоками размером block_size — целиком в память не загружается.
+func uploadFileToDriveMultipart(ctx context.Context, localPath, fileName string, size int64) (string, error) {
+	// 1. prepare: получаем upload_id и параметры блоков
+	body, err := larkJSON(ctx, "POST", larkBase+"/drive/v1/medias/upload_prepare", map[string]any{
+		"file_name":   fileName,
+		"parent_type": "bitable_file",
+		"parent_node": bitableApp,
+		"size":        size,
+	})
+	if err != nil {
+		return "", fmt.Errorf("upload_prepare: %w", err)
+	}
+	var prep struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			UploadID  string `json:"upload_id"`
+			BlockSize int64  `json:"block_size"`
+			BlockNum  int    `json:"block_num"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &prep); err != nil {
+		return "", fmt.Errorf("upload_prepare: %w", err)
+	}
+	if prep.Code != 0 || prep.Data.UploadID == "" || prep.Data.BlockSize <= 0 || prep.Data.BlockNum <= 0 {
+		return "", fmt.Errorf("upload_prepare code=%d msg=%s", prep.Code, prep.Msg)
+	}
+
+	token, err := getTenantToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	// 2. part: блоки последовательно
+	buf := make([]byte, prep.Data.BlockSize)
+	for seq := 0; seq < prep.Data.BlockNum; seq++ {
+		n, rerr := io.ReadFull(f, buf)
+		if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+			return "", fmt.Errorf("upload_part: чтение блока %d: %w", seq, rerr)
+		}
+		if err := uploadPart(ctx, token, prep.Data.UploadID, seq, buf[:n]); err != nil {
+			return "", err
+		}
+		log.Printf("[files] %s: блок %d/%d загружен (%d bytes)", fileName, seq+1, prep.Data.BlockNum, n)
+	}
+
+	// 3. finish: склеиваем блоки в файл
+	body, err = larkJSON(ctx, "POST", larkBase+"/drive/v1/medias/upload_finish", map[string]any{
+		"upload_id": prep.Data.UploadID,
+		"block_num": prep.Data.BlockNum,
+	})
+	if err != nil {
+		return "", fmt.Errorf("upload_finish: %w", err)
+	}
+	var fin struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			FileToken string `json:"file_token"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &fin); err != nil {
+		return "", fmt.Errorf("upload_finish: %w", err)
+	}
+	if fin.Code != 0 || fin.Data.FileToken == "" {
+		return "", fmt.Errorf("upload_finish code=%d msg=%s", fin.Code, fin.Msg)
+	}
+	return fin.Data.FileToken, nil
+}
+
+// uploadPart отправляет один блок multipart-загрузки (medias/upload_part).
+// checksum — adler32 блока, десятичной строкой.
+func uploadPart(ctx context.Context, token, uploadID string, seq int, block []byte) error {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fields := map[string]string{
+		"upload_id": uploadID,
+		"seq":       strconv.Itoa(seq),
+		"size":      strconv.Itoa(len(block)),
+		"checksum":  strconv.FormatUint(uint64(adler32.Checksum(block)), 10),
+	}
+	for k, v := range fields {
+		if err := mw.WriteField(k, v); err != nil {
+			return err
+		}
+	}
+	part, err := mw.CreateFormFile("file", "block")
+	if err != nil {
+		return err
+	}
+	if _, err := part.Write(block); err != nil {
+		return err
+	}
+	if err := mw.Close(); err != nil {
+		return err
+	}
+	req, _ := http.NewRequestWithContext(ctx, "POST", larkBase+"/drive/v1/medias/upload_part", &body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload_part seq=%d: %w", seq, err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return fmt.Errorf("upload_part seq=%d: %w", seq, err)
+	}
+	if out.Code != 0 {
+		return fmt.Errorf("upload_part seq=%d code=%d msg=%s", seq, out.Code, out.Msg)
+	}
+	return nil
 }
 
 // updateRecordFiles пишет file_token'ы в поле «Файлы» и отмечает «ФайлыЗагружены»=true.
@@ -1249,6 +1383,8 @@ func processFileDownloads(ctx context.Context) fileRunResult {
 // для статуса «На рассмотрении» и воронки «интересные»).
 // Семантика «все или ничего»: карточка обновляется только если ВСЕ файлы скачаны
 // и загружены; при частичных ошибках карточку не трогаем — повтор в следующем проходе.
+// Для воронки «интересные» (analyze=true) уже прикреплённые вложения не скачиваются
+// заново — их file_token переиспользуется (сравнение по sanitize-имени файла).
 // Для интересных карточек (analyze=true) успешное обновление дополнительно переводит
 // поле «Воронка» в «Документы скачал» (в т.ч. при отсутствии вложений).
 // analyze=true + дноуглубительное название → после успешной загрузки файлов
@@ -1270,18 +1406,32 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		}
 		return
 	}
+	// дедупликация (только воронка «интересные»): собираем имена/токены вложений,
+	// уже прикреплённых к карточке, — такие файлы не качаем заново, переиспользуем file_token.
+	// Для «На рассмотрении» — прежнее поведение: файлы уже есть → ранний выход.
+	var existingTokens []string
+	existingByName := map[string]string{}
 	if atts, ok := rec.Fields["Файлы"].([]any); ok && len(atts) > 0 {
-		// страховка от «застрявших» карточек: файлы уже загружены (старой версией кода),
-		// но воронка не переведена — догоняем переводом в «Документы скачал»
-		if analyze && bitableText(rec.Fields["Воронка"]) != funnelDocsDownloaded {
-			if err := putRecord(ctx, rec.RecordID, map[string]any{"Воронка": funnelDocsDownloaded}); err != nil {
-				log.Printf("[воронки] %s: ошибка перевода воронки в «%s»: %v", number, funnelDocsDownloaded, err)
-				res.Errors = append(res.Errors, fmt.Sprintf("%s: воронка→«%s»: %v", number, funnelDocsDownloaded, err))
-			} else {
-				log.Printf("[воронки] %s: файлы уже были, воронка → «%s»", number, funnelDocsDownloaded)
+		if !analyze {
+			return
+		}
+		for _, a := range atts {
+			m, ok := a.(map[string]any)
+			if !ok {
+				continue
+			}
+			tok, _ := m["file_token"].(string)
+			if tok == "" {
+				continue
+			}
+			existingTokens = append(existingTokens, tok)
+			if nm, _ := m["name"].(string); nm != "" {
+				existingByName[nm] = tok
 			}
 		}
-		return
+		if len(existingTokens) > 0 {
+			log.Printf("[files] %s: у карточки уже %d вложений — докачаем только недостающие", number, len(existingTokens))
+		}
 	}
 	tenderID := bitableText(rec.Fields["TenderplanID"])
 	if tenderID == "" {
@@ -1323,9 +1473,11 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		}
 	}
 
-	var tokens []string
+	var tokens []string // новые токены (загруженные в этом проходе)
 	var kept []dlFile
 	failed := 0 // неудачные файлы этой записи (скачивание или загрузка в Lark)
+	var failedNames []string
+	reused := 0 // переиспользованные (уже прикреплённые к карточке) вложения
 	defer func() {
 		for _, f := range kept {
 			os.Remove(f.path) // временные файлы-кандидаты больше не нужны
@@ -1336,9 +1488,16 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		if att.RealName == "" {
 			name = sanitizeFileName(att.DisplayName)
 		}
+		if tok, ok := existingByName[name]; ok {
+			// файл уже прикреплён к карточке — не качаем заново
+			reused++
+			log.Printf("[files] %s: %s — уже прикреплён, переиспользуем file_token=%s", number, name, tok)
+			continue
+		}
 		path, size, err := downloadAttachment(ctx, att)
 		if err != nil {
 			failed++
+			failedNames = append(failedNames, name)
 			res.FilesFailed++
 			res.Errors = append(res.Errors, fmt.Sprintf("%s: %s download: %v", number, name, err))
 			log.Printf("[files] %s: %s — ошибка скачивания: %v", number, name, err)
@@ -1349,6 +1508,7 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		if err != nil {
 			os.Remove(path)
 			failed++
+			failedNames = append(failedNames, name)
 			res.FilesFailed++
 			res.Errors = append(res.Errors, fmt.Sprintf("%s: %s upload: %v", number, name, err))
 			log.Printf("[files] %s: %s (%d bytes) — ошибка загрузки в Lark: %v", number, name, size, err)
@@ -1367,11 +1527,14 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 
 	// семантика «все или ничего»: при частичных ошибках карточку не обновляем —
 	// частичный набор токенов не привязываем, повторим в следующем проходе
+	// (уже прикреплённые файлы в следующем проходе не качаем — переиспользуем токены)
 	if failed > 0 {
-		log.Printf("[files] %s: неудачных файлов %d из %d — карточку не трогаем, будет повтор в следующем проходе", number, failed, len(atts))
-		res.Errors = append(res.Errors, fmt.Sprintf("%s: частичная загрузка (%d из %d не удалось) — карточка не обновлена, повтор в следующем проходе", number, failed, len(atts)))
+		log.Printf("[files] %s: не хватает %d файлов из %d (%s) — карточку не трогаем, будет повтор в следующем проходе", number, failed, len(atts), strings.Join(failedNames, ", "))
+		res.Errors = append(res.Errors, fmt.Sprintf("%s: частичная загрузка (не хватает %d из %d: %s) — карточка не обновлена, повтор в следующем проходе", number, failed, len(atts), strings.Join(failedNames, ", ")))
 		return
 	}
+	// мерж: уже прикреплённые + новые токены (PUT заменяет поле «Файлы» целиком)
+	tokens = append(existingTokens, tokens...)
 	if len(tokens) == 0 {
 		return // все файлы упали — карточку не трогаем, повторим в следующем проходе
 	}
@@ -1380,7 +1543,11 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		return
 	}
 	res.RecordsDone++
-	log.Printf("[files] %s: карточка обновлена, файлов: %d", number, len(tokens))
+	if reused > 0 {
+		log.Printf("[files] %s: карточка обновлена, файлов: %d (из них переиспользовано уже прикреплённых: %d)", number, len(tokens), reused)
+	} else {
+		log.Printf("[files] %s: карточка обновлена, файлов: %d", number, len(tokens))
+	}
 	if analyze {
 		log.Printf("[воронки] %s: документы скачаны, воронка → «%s»", number, funnelDocsDownloaded)
 	}
