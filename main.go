@@ -939,13 +939,27 @@ func sanitizeFileName(name string) string {
 }
 
 // downloadAttachment скачивает файл потоково во временный файл в os.TempDir().
-// Прямая ссылка; при 401/403/404 или пустом теле (HTTP 200 с 0 байт — так ЭТП ГПБ
-// отвечает небраузерным клиентам) — запасной прокси /api/tenders/file?href= (deprecated, но работает).
+// Прямая ссылка; сетевые сбои (EOF/reset — ЭТП ГПБ рвёт соединения анти-ботом) —
+// до 3 попыток с нарастающей паузой; при 401/403/404 или пустом теле (HTTP 200
+// с 0 байт) — запасной прокси /api/tenders/file?href= (deprecated, но работает).
 // Возвращает путь к временному файлу (вызывающий обязан удалить) и размер.
 func downloadAttachment(ctx context.Context, att tpAttachment) (string, int64, error) {
-	status, path, size, err := downloadToTemp(ctx, att.Href, false)
-	if err == nil {
-		return path, size, nil
+	var status int
+	var path string
+	var size int64
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		status, path, size, err = downloadToTemp(ctx, att.Href, false)
+		if err == nil {
+			return path, size, nil
+		}
+		if status != 0 {
+			break // HTTP-ответ с ошибкой — не транспортный сбой, ретраить бессмысленно
+		}
+		if attempt < 2 {
+			log.Printf("[files] %q: сетевой сбой (%v), попытка %d/3", att.RealName, err, attempt+1)
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		}
 	}
 	if status == http.StatusOK || status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
 		log.Printf("[files] direct %q -> HTTP %d (%v), пробуем прокси /api/tenders/file", att.RealName, status, err)
@@ -1346,7 +1360,7 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		} else {
 			os.Remove(path) // временный файл больше не нужен
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(1 * time.Second) // пауза между файлами — ЭТП ГПБ режет частые запросы анти-ботом
 	}
 
 	// семантика «все или ничего»: при частичных ошибках карточку не обновляем —
