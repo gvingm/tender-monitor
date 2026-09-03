@@ -37,7 +37,6 @@ const (
 	kimiAPI             = "https://api.moonshot.ai/v1/chat/completions"
 	kimiFilesAPI        = "https://api.moonshot.ai/v1/files" // Kimi Files API (загрузка ТЗ для анализа)
 	kimiModel           = "kimi-k2.6"
-	larkBase            = "https://open.larksuite.com/open-apis"
 	listenAddr          = "0.0.0.0:8787" // IPv4 явно: WSL localhostForwarding не пробрасывает tcp6-only сокеты
 	dailyRunHour        = 8
 	dailyRunMinute      = 0
@@ -68,6 +67,10 @@ var (
 	bitableApp    = envOrMulti(defaultBitableApp, "LARK_BITABLE_APP", "Lark_Bitable_App")
 	bitableTable  = envOrMulti(defaultBitableTable, "LARK_BITABLE_TABLE", "Lark_Bitable_Table")
 	chatID        = envOrMulti(defaultChatID, "LARK_CHAT_ID", "Lark_Chat_ID")
+
+	// larkBase — базовый URL Lark OpenAPI. Тенант на Feishu (open.feishu.cn);
+	// open.larksuite.com из РФ периодически недоступен (таймауты). Переопределяется env LARK_BASE.
+	larkBase = strings.TrimRight(envOrMulti("https://open.feishu.cn/open-apis", "LARK_BASE", "Lark_Base"), "/")
 )
 
 func envOrMulti(def string, keys ...string) string {
