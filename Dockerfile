@@ -18,6 +18,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
 COPY --from=build /out/tender-monitor /app/tender-monitor
+COPY reports/ /app/reports/
 
 EXPOSE 8787
 

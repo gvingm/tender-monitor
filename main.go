@@ -2333,6 +2333,7 @@ func main() {
 	mux.HandleFunc("/webhook/mail-tenders", h.handleMailTenders)
 	mux.HandleFunc("/tenders", h.handleListTenders)
 	mux.HandleFunc("/report", h.handleReport)
+	mux.Handle("/reports/", http.StripPrefix("/reports/", http.FileServer(http.Dir("/app/reports"))))
 
 	srv := &http.Server{
 		Addr:              listenAddr,
