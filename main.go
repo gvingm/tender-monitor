@@ -948,7 +948,8 @@ func downloadAttachment(ctx context.Context, att tpAttachment) (string, int64, e
 	var path string
 	var size int64
 	var err error
-	for attempt := 0; attempt < 3; attempt++ {
+	// до 4 попыток с нарастающей паузой (3с/8с/20с): ЭТП ГПБ рвёт соединения анти-ботом
+	for attempt := 0; attempt < 4; attempt++ {
 		status, path, size, err = downloadToTemp(ctx, att.Href, false)
 		if err == nil {
 			return path, size, nil
@@ -956,9 +957,10 @@ func downloadAttachment(ctx context.Context, att tpAttachment) (string, int64, e
 		if status != 0 {
 			break // HTTP-ответ с ошибкой — не транспортный сбой, ретраить бессмысленно
 		}
-		if attempt < 2 {
-			log.Printf("[files] %q: сетевой сбой (%v), попытка %d/3", att.RealName, err, attempt+1)
-			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		if attempt < 3 {
+			delay := []time.Duration{3 * time.Second, 8 * time.Second, 20 * time.Second}[attempt]
+			log.Printf("[files] %q: сетевой сбой (%v), попытка %d/4 через %v", att.RealName, err, attempt+1, delay)
+			time.Sleep(delay)
 		}
 	}
 	if status == http.StatusOK || status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
