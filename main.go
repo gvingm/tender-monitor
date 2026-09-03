@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -131,6 +132,7 @@ var fileClient = &http.Client{
 		MaxIdleConns:        20,
 		MaxIdleConnsPerHost: 4,
 		IdleConnTimeout:     60 * time.Second,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, // российские ЭТП используют сертификаты Минцифры, которых нет в CA-бандле контейнера
 	},
 }
 
