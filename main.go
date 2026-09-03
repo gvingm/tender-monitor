@@ -939,15 +939,16 @@ func sanitizeFileName(name string) string {
 }
 
 // downloadAttachment скачивает файл потоково во временный файл в os.TempDir().
-// Прямая ссылка; при 401/403/404 — запасной прокси /api/tenders/file?href= (deprecated, но работает).
+// Прямая ссылка; при 401/403/404 или пустом теле (HTTP 200 с 0 байт — так ЭТП ГПБ
+// отвечает небраузерным клиентам) — запасной прокси /api/tenders/file?href= (deprecated, но работает).
 // Возвращает путь к временному файлу (вызывающий обязан удалить) и размер.
 func downloadAttachment(ctx context.Context, att tpAttachment) (string, int64, error) {
 	status, path, size, err := downloadToTemp(ctx, att.Href, false)
 	if err == nil {
 		return path, size, nil
 	}
-	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
-		log.Printf("[files] direct %q -> HTTP %d, пробуем прокси /api/tenders/file", att.RealName, status)
+	if status == http.StatusOK || status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
+		log.Printf("[files] direct %q -> HTTP %d (%v), пробуем прокси /api/tenders/file", att.RealName, status, err)
 		proxyURL := tenderplanAPI + "/tenders/file?href=" + url.QueryEscape(att.Href)
 		_, path, size, err = downloadToTemp(ctx, proxyURL, true)
 	}
@@ -968,6 +969,8 @@ func downloadToTemp(ctx context.Context, u string, bearer bool) (int, string, in
 	if bearer {
 		req.Header.Set("Authorization", "Bearer "+tenderplanKey)
 	}
+	// браузерный UA: ЭТП ГПБ и др. отдают пустое тело (0 байт) небраузерным клиентам
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 	resp, err := fileClient.Do(req)
 	if err != nil {
 		return 0, "", 0, err
@@ -985,6 +988,11 @@ func downloadToTemp(ctx context.Context, u string, bearer bool) (int, string, in
 	if err != nil {
 		os.Remove(tmp.Name())
 		return 0, "", 0, err
+	}
+	if size == 0 {
+		// пустое тело при HTTP 200 — файл не скачался; считаем ошибкой (пойдём в прокси/повтор)
+		os.Remove(tmp.Name())
+		return resp.StatusCode, "", 0, fmt.Errorf("HTTP 200, но пустое тело (0 байт)")
 	}
 	return resp.StatusCode, tmp.Name(), size, nil
 }
