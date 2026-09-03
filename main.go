@@ -1,5 +1,7 @@
 // Package main — Tender Monitor: мониторинг тендеров Tenderplan + Lark Bitable + Kimi-резюме
-// + скачивание файлов тендера при переходе карточки в статус «На рассмотрении».
+// + скачивание файлов тендера (статус «На рассмотрении» / воронка «интересные»);
+// интересная карточка переходит в воронку «Документы скачал» только после
+// успешной загрузки ВСЕХ файлов (частичная загрузка не фиксируется — повтор в следующем проходе).
 //
 // Go-порт исходного Python FastAPI-приложения (см. git history).
 // Один файл, stdlib only.
@@ -89,6 +91,10 @@ var moscowTZ = func() *time.Location {
 	}
 	return time.FixedZone("MSK", 3*60*60)
 }()
+
+// funnelDocsDownloaded — значение поля «Воронка» для интересных тендеров,
+// у которых ВСЕ документы успешно скачаны и загружены в карточку.
+const funnelDocsDownloaded = "Документы скачал"
 
 // voronkaNewLabel — значение поля «Воронка» для новых тендеров текущего прогона.
 func voronkaNewLabel() string {
@@ -1048,8 +1054,10 @@ func uploadFileToDrive(ctx context.Context, localPath, fileName string, size int
 }
 
 // updateRecordFiles пишет file_token'ы в поле «Файлы» и отмечает «ФайлыЗагружены»=true.
+// При markFunnelDone=true в той же атомарной PUT-записи поле «Воронка» переводится
+// в «Документы скачал» (для карточек воронки «интересные»).
 // При отсутствии полей — пробует создать их и повторить; если не вышло — обновляет без спорного поля.
-func updateRecordFiles(ctx context.Context, recordID string, fileTokens []string) error {
+func updateRecordFiles(ctx context.Context, recordID string, fileTokens []string, markFunnelDone bool) error {
 	atts := make([]map[string]string, 0, len(fileTokens))
 	for _, ft := range fileTokens {
 		atts = append(atts, map[string]string{"file_token": ft})
@@ -1057,6 +1065,9 @@ func updateRecordFiles(ctx context.Context, recordID string, fileTokens []string
 	fields := map[string]any{
 		"Файлы":          atts,
 		"ФайлыЗагружены": true,
+	}
+	if markFunnelDone {
+		fields["Воронка"] = funnelDocsDownloaded
 	}
 	err := putRecord(ctx, recordID, fields)
 	if err == nil {
@@ -1069,10 +1080,11 @@ func updateRecordFiles(ctx context.Context, recordID string, fileTokens []string
 	log.Printf("[files] поле не найдено (%s), создаём и повторяем", le.Msg)
 	_ = ensureBitableField(ctx, "Файлы", 17)
 	_ = ensureBitableField(ctx, "ФайлыЗагружены", 7)
+	_ = ensureBitableField(ctx, "Воронка", 1)
 	if err = putRecord(ctx, recordID, fields); err == nil {
 		return nil
 	}
-	// fallback: только вложения, без чекбокса
+	// fallback: только вложения (и воронка, если запрошена), без чекбокса
 	delete(fields, "ФайлыЗагружены")
 	return putRecord(ctx, recordID, fields)
 }
@@ -1205,6 +1217,10 @@ func processFileDownloads(ctx context.Context) fileRunResult {
 
 // processRecordFiles — скачивание и загрузка файлов одной карточки (общая логика
 // для статуса «На рассмотрении» и воронки «интересные»).
+// Семантика «все или ничего»: карточка обновляется только если ВСЕ файлы скачаны
+// и загружены; при частичных ошибках карточку не трогаем — повтор в следующем проходе.
+// Для интересных карточек (analyze=true) успешное обновление дополнительно переводит
+// поле «Воронка» в «Документы скачал» (в т.ч. при отсутствии вложений).
 // analyze=true + дноуглубительное название → после успешной загрузки файлов
 // запускается первичный анализ ТЗ через Kimi.
 func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName string, analyze bool, res *fileRunResult) {
@@ -1225,6 +1241,16 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		return
 	}
 	if atts, ok := rec.Fields["Файлы"].([]any); ok && len(atts) > 0 {
+		// страховка от «застрявших» карточек: файлы уже загружены (старой версией кода),
+		// но воронка не переведена — догоняем переводом в «Документы скачал»
+		if analyze && bitableText(rec.Fields["Воронка"]) != funnelDocsDownloaded {
+			if err := putRecord(ctx, rec.RecordID, map[string]any{"Воронка": funnelDocsDownloaded}); err != nil {
+				log.Printf("[воронки] %s: ошибка перевода воронки в «%s»: %v", number, funnelDocsDownloaded, err)
+				res.Errors = append(res.Errors, fmt.Sprintf("%s: воронка→«%s»: %v", number, funnelDocsDownloaded, err))
+			} else {
+				log.Printf("[воронки] %s: файлы уже были, воронка → «%s»", number, funnelDocsDownloaded)
+			}
+		}
 		return
 	}
 	tenderID := bitableText(rec.Fields["TenderplanID"])
@@ -1240,11 +1266,14 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 	}
 	if len(atts) == 0 {
 		log.Printf("[files] %s (%s): файлов нет — отмечаем ФайлыЗагружены", number, tenderID)
-		if err := updateRecordFiles(ctx, rec.RecordID, nil); err != nil {
+		if err := updateRecordFiles(ctx, rec.RecordID, nil, analyze); err != nil {
 			res.Errors = append(res.Errors, number+": mark-empty "+err.Error())
 			return
 		}
 		res.RecordsDone++
+		if analyze {
+			log.Printf("[воронки] %s: документы скачаны (вложений нет), воронка → «%s»", number, funnelDocsDownloaded)
+		}
 		if needAnalysis {
 			// вложений нет — зафиксируем это в поле «Анализ ТЗ», чтобы не возвращаться
 			if err := runTZAnalysis(ctx, rec, nil); err != nil {
@@ -1266,6 +1295,7 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 
 	var tokens []string
 	var kept []dlFile
+	failed := 0 // неудачные файлы этой записи (скачивание или загрузка в Lark)
 	defer func() {
 		for _, f := range kept {
 			os.Remove(f.path) // временные файлы-кандидаты больше не нужны
@@ -1278,6 +1308,7 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		}
 		path, size, err := downloadAttachment(ctx, att)
 		if err != nil {
+			failed++
 			res.FilesFailed++
 			res.Errors = append(res.Errors, fmt.Sprintf("%s: %s download: %v", number, name, err))
 			log.Printf("[files] %s: %s — ошибка скачивания: %v", number, name, err)
@@ -1287,6 +1318,7 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		token, err := uploadFileToDrive(ctx, path, name, size)
 		if err != nil {
 			os.Remove(path)
+			failed++
 			res.FilesFailed++
 			res.Errors = append(res.Errors, fmt.Sprintf("%s: %s upload: %v", number, name, err))
 			log.Printf("[files] %s: %s (%d bytes) — ошибка загрузки в Lark: %v", number, name, size, err)
@@ -1303,15 +1335,25 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		time.Sleep(200 * time.Millisecond)
 	}
 
+	// семантика «все или ничего»: при частичных ошибках карточку не обновляем —
+	// частичный набор токенов не привязываем, повторим в следующем проходе
+	if failed > 0 {
+		log.Printf("[files] %s: неудачных файлов %d из %d — карточку не трогаем, будет повтор в следующем проходе", number, failed, len(atts))
+		res.Errors = append(res.Errors, fmt.Sprintf("%s: частичная загрузка (%d из %d не удалось) — карточка не обновлена, повтор в следующем проходе", number, failed, len(atts)))
+		return
+	}
 	if len(tokens) == 0 {
 		return // все файлы упали — карточку не трогаем, повторим в следующем проходе
 	}
-	if err := updateRecordFiles(ctx, rec.RecordID, tokens); err != nil {
+	if err := updateRecordFiles(ctx, rec.RecordID, tokens, analyze && failed == 0); err != nil {
 		res.Errors = append(res.Errors, number+": update record "+err.Error())
 		return
 	}
 	res.RecordsDone++
 	log.Printf("[files] %s: карточка обновлена, файлов: %d", number, len(tokens))
+	if analyze {
+		log.Printf("[воронки] %s: документы скачаны, воронка → «%s»", number, funnelDocsDownloaded)
+	}
 
 	// первичный анализ ТЗ (только дноуглубительные из воронки «интересные»)
 	if needAnalysis {
