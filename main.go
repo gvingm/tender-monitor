@@ -1324,6 +1324,17 @@ func findInterestingRecords(ctx context.Context) ([]bitableRecord, error) {
 	}, []string{"Номер", "TenderplanID", "Файлы", "Воронка", "Анализ ТЗ"})
 }
 
+// findInterestingDoneRecords ищет «застрявшие» карточки воронки «интересные»,
+// у которых файлы уже загружены (ФайлыЗагружены=true), но воронка не переведена.
+// Их вложения не трогаем — только догоняем перевод воронки в «Документы скачал».
+func findInterestingDoneRecords(ctx context.Context) ([]bitableRecord, error) {
+	fields := []string{"Номер", "TenderplanID", "Файлы", "ФайлыЗагружены", "Воронка", "Анализ ТЗ"}
+	return bitableSearch(ctx, []map[string]any{
+		{"field_name": "Воронка", "operator": "is", "value": []string{"интересные"}},
+		{"field_name": "ФайлыЗагружены", "operator": "is", "value": []string{"true"}},
+	}, fields)
+}
+
 // processFileDownloads — основной проход файлового пайплайна.
 // Обрабатывает И карточки «На рассмотрении», И карточки воронки «интересные»
 // (для интересных дноуглубительных после загрузки файлов запускается анализ ТЗ).
@@ -1359,9 +1370,19 @@ func processFileDownloads(ctx context.Context) fileRunResult {
 	if ierr != nil {
 		log.Printf("[воронки] поиск карточек «интересные»: %v", ierr)
 		res.Errors = append(res.Errors, "[воронки] search interesting: "+ierr.Error())
-	} else {
-		log.Printf("[воронки] карточек «интересные» без файлов: %d", len(intRecs))
+	}
+	// «застрявшие» интересные с уже загруженными файлами — догон воронки
+	intDone, derr := findInterestingDoneRecords(ctx)
+	if derr != nil {
+		log.Printf("[воронки] поиск «интересных» с файлами (догон воронки): %v", derr)
+		res.Errors = append(res.Errors, "[воронки] search interesting-done: "+derr.Error())
+	}
+	if ierr == nil || derr == nil {
+		log.Printf("[воронки] карточек «интересные» без файлов: %d, с файлами (догон воронки): %d", len(intRecs), len(intDone))
 		for _, rec := range intRecs {
+			queue[rec.RecordID] = queueItem{rec: rec, interesting: true}
+		}
+		for _, rec := range intDone {
 			queue[rec.RecordID] = queueItem{rec: rec, interesting: true}
 		}
 	}
@@ -1396,6 +1417,18 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 
 	// клиентская перестраховка: пропускаем, если файлы уже есть или чекбокс отмечен
 	if done, _ := rec.Fields["ФайлыЗагружены"].(bool); done {
+		// «застрявшие» интересные: файлы загружены, но воронка не переведена —
+		// догоняем переводом. Только поле «Воронка» через putRecord:
+		// updateRecordFiles нельзя — он перезаписывает «Файлы», а токены здесь неизвестны
+		if analyze && bitableText(rec.Fields["Воронка"]) != funnelDocsDownloaded {
+			if err := putRecord(ctx, rec.RecordID, map[string]any{"Воронка": funnelDocsDownloaded}); err != nil {
+				log.Printf("[воронки] %s: ошибка перевода воронки в «%s»: %v", number, funnelDocsDownloaded, err)
+				res.Errors = append(res.Errors, fmt.Sprintf("%s: воронка→«%s»: %v", number, funnelDocsDownloaded, err))
+			} else {
+				res.RecordsDone++
+				log.Printf("[воронки] %s: файлы уже были загружены, воронка → «%s»", number, funnelDocsDownloaded)
+			}
+		}
 		// файлы уже загружены — остаётся только анализ ТЗ (если нужен)
 		if needAnalysis {
 			if err := runTZAnalysis(ctx, rec, nil); err != nil {
@@ -1878,8 +1911,14 @@ func processMarkedTenders(ctx context.Context) marksResult {
 			item.Status = "создана запись, воронка «интересные»"
 			log.Printf("[воронки] %s: создана запись (воронка «интересные»), record=%s", s.Number, recID)
 		} else {
-			// запись уже есть — обновляем воронку на «интересные», не дублируя запись
-			if bitableText(rec.Fields["Воронка"]) != "интересные" {
+			// запись уже есть — обновляем воронку на «интересные», не дублируя запись.
+			// «Документы скачал» — более поздняя стадия воронки, её НЕ даунгрейдим.
+			switch cur := bitableText(rec.Fields["Воронка"]); cur {
+			case "интересные":
+				item.Status = "уже в воронке «интересные»"
+			case funnelDocsDownloaded:
+				item.Status = "уже в воронке «Документы скачал»"
+			default:
 				if err := putRecord(ctx, rec.RecordID, map[string]any{"Воронка": "интересные"}); err != nil {
 					res.Errors = append(res.Errors, s.Number+": update voronka "+err.Error())
 					item.Status = "запись есть, ошибка обновления воронки: " + err.Error()
@@ -1889,8 +1928,6 @@ func processMarkedTenders(ctx context.Context) marksResult {
 				res.Updated++
 				item.Status = "запись уже была — воронка обновлена на «интересные»"
 				log.Printf("[воронки] %s: воронка обновлена на «интересные», record=%s", s.Number, rec.RecordID)
-			} else {
-				item.Status = "уже в воронке «интересные»"
 			}
 		}
 
