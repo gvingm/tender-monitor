@@ -1,4 +1,4 @@
-// Package main — Tender Monitor: мониторинг тендеров Tenderplan + Lark Bitable + Kimi-резюме
+// Package main — Tender Monitor: мониторинг тендеров Tenderplan + Lark Bitable + LLM-резюме
 // + скачивание файлов тендера (статус «На рассмотрении» / воронка «интересные»);
 // интересная карточка переходит в воронку «Документы скачал» только после
 // успешной загрузки ВСЕХ файлов (частичная загрузка не фиксируется — повтор в следующем проходе).
@@ -8,6 +8,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -15,6 +16,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"hash/adler32"
 	"io"
@@ -24,20 +26,20 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ===== CONFIG =====
 
 const (
-	tenderplanAPI   = "https://tenderplan.ru/api"
-	llmAPI         = "https://api.minimax.io/v1/chat/completions"
-	llmModel       = "MiniMax-M3"
+	tenderplanAPI = "https://tenderplan.ru/api"
+	llmAPI        = "https://api.minimax.io/v1/chat/completions"
+	llmModel      = "MiniMax-M3"
 	listenAddr          = "0.0.0.0:8787" // IPv4 явно: WSL localhostForwarding не пробрасывает tcp6-only сокеты
 	dailyRunHour        = 8
 	dailyRunMinute      = 0
@@ -48,7 +50,7 @@ const (
 	maxAnalysisFileSize = 50 << 20         // файлы >50 МБ в анализ ТЗ не берём
 	analysisRetryDelay  = time.Hour        // минимальный интервал между попытками анализа ТЗ одной записи
 	maxListPages        = 1                // страниц getlist на ключевое слово (50/стр.; дневному дайджесту хватает)
-	maxNewPerRun        = 20               // максимум новых тендеров за прогон (Kimi дорогой, чат не спамим)
+	maxNewPerRun        = 20               // максимум новых тендеров за прогон (LLM дорогой, чат не спамим)
 	tpRequestPause      = 250 * time.Millisecond
 	tokenTTL            = 2 * time.Hour
 
@@ -61,7 +63,7 @@ const (
 var (
 	// Поддерживаем и старые mixed-case имена переменных (fallback).
 	tenderplanKey = envOrMulti("", "TENDERPLAN_KEY", "Tenderplan_API_Key")
-	kimiKey       = envOrMulti("", "KIMI_KEY", "Kimi_API_Key")
+	minimaxKey    = envOrMulti("", "MINIMAX_KEY", "KIMI_KEY", "Kimi_API_Key")
 	mailSecret    = os.Getenv("MAIL_SECRET")
 	larkAppID     = envOrMulti(defaultAppID, "LARK_APP_ID", "Lark_App_ID")
 	larkAppSecret = envOrMulti("", "LARK_APP_SECRET", "Lark_App_Secret")
@@ -396,7 +398,7 @@ func msToRFC3339(ms int64) string {
 
 // ===== KIMI =====
 
-func kimiSummarize(ctx context.Context, t Tender) (string, error) {
+func llmSummarize(ctx context.Context, t Tender) (string, error) {
 	prompt := fmt.Sprintf(`Сделай краткое резюме (5-7 строк) этого тендера:
 
 Название: %s
@@ -416,17 +418,13 @@ func kimiSummarize(ctx context.Context, t Tender) (string, error) {
 Рекомендация: [подавать/не подавать]`,
 		t.Name, t.Customer, t.Description, formatAmount(t.Amount), t.Region, t.Deadline)
 
-	// ВАЖНО: reasoning-модель съедает токены на «размышления» — нужен запас,
-	// иначе content приходит пустым (finish_reason=length). И длинный таймаут.
-	// temperature НЕ передаём: kimi-k2.6 принимает только temperature=1,
-	// другое значение → HTTP 400 invalid_request_error.
 	body, _ := json.Marshal(map[string]any{
 		"model":      llmModel,
 		"messages":   []map[string]string{{"role": "user", "content": prompt}},
 		"max_tokens": 4096,
 	})
 	req, _ := http.NewRequestWithContext(ctx, "POST", llmAPI, bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+kimiKey)
+	req.Header.Set("Authorization", "Bearer "+minimaxKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := llmClient.Do(req)
 	if err != nil {
@@ -444,7 +442,7 @@ func kimiSummarize(ctx context.Context, t Tender) (string, error) {
 		return "", err
 	}
 	if len(out.Choices) == 0 || out.Choices[0].Message.Content == "" {
-		return "", fmt.Errorf("kimi: empty response")
+		return "", fmt.Errorf("llm: empty response")
 	}
 	return out.Choices[0].Message.Content, nil
 }
@@ -774,7 +772,7 @@ func processTenders(ctx context.Context) runResults {
 			continue
 		}
 		for _, t := range tenders {
-			// дешёвая пред-проверка дубля до дорогих вызовов (полная модель, Kimi)
+			// дешёвая пред-проверка дубля до дорогих вызовов (полная модель, LLM)
 			dup, err := findRecordByNumber(ctx, t.Number)
 			if err != nil {
 				res.Errors = append(res.Errors, t.Number+": dupcheck "+err.Error())
@@ -793,13 +791,13 @@ func processTenders(ctx context.Context) runResults {
 					log.Printf("[tenderplan] href %s: %v", t.ID, err)
 				}
 			}
-			// Kimi — опционально: при ошибке/лимите API тендер НЕ теряем,
+			// LLM — опционально: при ошибке/лимите API тендер НЕ теряем,
 			// пишем в Bitable без резюме (пометка в поле).
-			summary, err := kimiSummarize(ctx, t)
+			summary, err := llmSummarize(ctx, t)
 			if err != nil {
-				log.Printf("[run] kimi %s: %v", t.Number, err)
-				res.Errors = append(res.Errors, t.Number+": kimi "+err.Error())
-				summary = "⚠️ Резюме недоступно: ошибка Kimi API (см. логи). Данные тендера — в полях карточки."
+				log.Printf("[run] llm %s: %v", t.Number, err)
+				res.Errors = append(res.Errors, t.Number+": llm "+err.Error())
+				summary = "⚠️ Резюме недоступно: ошибка LLM API (см. логи). Данные тендера — в полях карточки."
 			}
 			r, err := addToBitable(ctx, t, name, summary, voronka)
 			if err != nil {
@@ -828,12 +826,12 @@ func processMailTenders(ctx context.Context, tenders []Tender) runResults {
 	res := runResults{}
 	for _, t := range tenders {
 		cluster := classifyCluster(t)
-		// Kimi — опционально: при ошибке/лимите API тендер не теряем
-		summary, err := kimiSummarize(ctx, t)
+		// LLM — опционально: при ошибке/лимите API тендер не теряем
+		summary, err := llmSummarize(ctx, t)
 		if err != nil {
-			log.Printf("[mail] kimi %s: %v", t.Number, err)
-			res.Errors = append(res.Errors, t.Number+": kimi "+err.Error())
-			summary = "⚠️ Резюме недоступно: ошибка Kimi API (см. логи). Данные тендера — в полях карточки."
+			log.Printf("[mail] llm %s: %v", t.Number, err)
+			res.Errors = append(res.Errors, t.Number+": llm "+err.Error())
+			summary = "⚠️ Резюме недоступно: ошибка LLM API (см. логи). Данные тендера — в полях карточки."
 		}
 		r, err := addToBitable(ctx, t, cluster, summary, "")
 		if err != nil {
@@ -1417,7 +1415,7 @@ func processFileDownloads(ctx context.Context) fileRunResult {
 // Для интересных карточек (analyze=true) успешное обновление дополнительно переводит
 // поле «Воронка» в «Документы скачал» (в т.ч. при отсутствии вложений).
 // analyze=true + дноуглубительное название → после успешной загрузки файлов
-// запускается первичный анализ ТЗ через Kimi.
+// запускается первичный анализ ТЗ через LLM.
 func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName string, analyze bool, res *fileRunResult) {
 	number := bitableText(rec.Fields["Номер"])
 	needAnalysis := analyze && tenderName != "" && dredgeRe.MatchString(tenderName) &&
@@ -1876,7 +1874,7 @@ func processMarkedTenders(ctx context.Context) marksResult {
 		}
 
 		if rec == nil {
-			// записи нет — догружаем полную карточку и создаём (Kimi-резюме опционально)
+			// записи нет — догружаем полную карточку и создаём (LLM-резюме опционально)
 			t := tenderFromSub(s)
 			if d, derr := fetchTenderDetails(ctx, s.ID); derr == nil {
 				if t.URL == "" {
@@ -1893,11 +1891,11 @@ func processMarkedTenders(ctx context.Context) marksResult {
 			} else {
 				log.Printf("[метки] полная карточка %s: %v", s.ID, derr)
 			}
-			summary, kerr := kimiSummarize(ctx, t)
+			summary, kerr := llmSummarize(ctx, t)
 			if kerr != nil {
-				log.Printf("[метки] kimi %s: %v", s.Number, kerr)
-				res.Errors = append(res.Errors, s.Number+": kimi "+kerr.Error())
-				summary = "⚠️ Резюме недоступно: ошибка Kimi API (см. логи). Данные тендера — в полях карточки."
+				log.Printf("[метки] llm %s: %v", s.Number, kerr)
+				res.Errors = append(res.Errors, s.Number+": llm "+kerr.Error())
+				summary = "⚠️ Резюме недоступно: ошибка LLM API (см. логи). Данные тендера — в полях карточки."
 			}
 			r, err := addToBitable(ctx, t, classifyCluster(t), summary, "интересные")
 			if err != nil {
@@ -2071,7 +2069,7 @@ func pickTZCandidates(atts []tpAttachment) []tpAttachment {
 	return src
 }
 
-// analysisAttempts — защита от повторных прогонов Kimi по одной записи (ошибки API, цикл каждые 5 мин).
+// analysisAttempts — защита от повторных прогонов LLM по одной записи (ошибки API, цикл каждые 5 мин).
 var analysisAttempts = struct {
 	sync.Mutex
 	m map[string]time.Time
@@ -2088,7 +2086,7 @@ func markAnalysisAttempt(recordID string) bool {
 	return true
 }
 
-// runTZAnalysis — первичный анализ ТЗ дноуглубительного тендера через Kimi Files API.
+// runTZAnalysis — первичный анализ ТЗ дноуглубительного тендера через LLM.
 // local — уже скачанные файлы-кандидаты (nil → выбрать и скачать самостоятельно по TenderplanID).
 // Результат пишется в поля «Анализ ТЗ», «Объём грунта», «Отвал: расстояние», «Техника», «Стоимость 1 м³».
 func runTZAnalysis(ctx context.Context, rec bitableRecord, local []dlFile) error {
@@ -2140,12 +2138,12 @@ func runTZAnalysis(ctx context.Context, rec bitableRecord, local []dlFile) error
 		return fmt.Errorf("файлы ТЗ не скачаны — анализ отложен")
 	}
 
-	// извлекаем текст первого PDF-файла локально через pymupdf
+	// извлекаем текст первого файла ТЗ локально
 	var tzText, usedFile string
 	for _, f := range local {
-		content, err := extractPDFText(ctx, f.path)
+		content, err := extractFileText(ctx, f.path)
 		if err != nil {
-			log.Printf("[анализ] %s: pymupdf %s: %v", number, f.name, err)
+			log.Printf("[анализ] %s: extract %s: %v", number, f.name, err)
 			continue
 		}
 		if strings.TrimSpace(content) == "" {
@@ -2158,9 +2156,9 @@ func runTZAnalysis(ctx context.Context, rec bitableRecord, local []dlFile) error
 	if tzText == "" {
 		return fmt.Errorf("не удалось извлечь текст ни из одного файла ТЗ")
 	}
-	log.Printf("[анализ] %s: текст ТЗ извлечён из %q (%d знаков), запускаем Kimi-анализ", number, usedFile, len([]rune(tzText)))
+	log.Printf("[анализ] %s: текст ТЗ извлечён из %q (%d знаков), запускаем LLM-анализ", number, usedFile, len([]rune(tzText)))
 
-	vals, full, err := kimiAnalyzeTZ(ctx, tzText)
+	vals, full, err := llmAnalyzeTZ(ctx, tzText)
 	if err != nil {
 		return err
 	}
@@ -2171,102 +2169,181 @@ func runTZAnalysis(ctx context.Context, rec bitableRecord, local []dlFile) error
 	return nil
 }
 
-/*
-func kimiUploadFile(ctx context.Context, localPath, fileName string) (string, error) {
-	pr, pw := io.Pipe()
-	mw := multipart.NewWriter(pw)
-	go func() {
-		var werr error
-		defer func() {
-			if werr != nil {
-				_ = pw.CloseWithError(werr)
-			} else {
-				_ = pw.Close()
-			}
-		}()
-		if werr = mw.WriteField("purpose", "file-extract"); werr != nil {
-			return
-		}
-		var part io.Writer
-		if part, werr = mw.CreateFormFile("file", fileName); werr != nil {
-			return
-		}
-		var f *os.File
-		if f, werr = os.Open(localPath); werr != nil {
-			return
-		}
-		defer f.Close()
-		if _, werr = io.Copy(part, f); werr != nil {
-			return
-		}
-		werr = mw.Close()
-	}()
-
-	req, _ := http.NewRequestWithContext(ctx, "POST", kimiFilesAPI, pr)
-	req.Header.Set("Authorization", "Bearer "+kimiKey)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	resp, err := llmClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	var out struct {
-		ID    string `json:"id"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("kimi files: bad json: %.200s", string(body))
-	}
-	if out.Error != nil {
-		return "", fmt.Errorf("kimi files: %s", out.Error.Message)
-	}
-	if resp.StatusCode != http.StatusOK || out.ID == "" {
-		return "", fmt.Errorf("kimi files HTTP %d: %.200s", resp.StatusCode, string(body))
-	}
-	return out.ID, nil
-}
-
-func kimiFileContent(ctx context.Context, fileID string) (string, error) {
-	req, _ := http.NewRequestWithContext(ctx, "GET", kimiFilesAPI+"/"+fileID+"/content", nil)
-	req.Header.Set("Authorization", "Bearer "+kimiKey)
-	resp, err := llmClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("kimi file content HTTP %d: %.200s", resp.StatusCode, string(body))
-	}
-	var out struct {
-		Content string `json:"content"`
-	}
-	if err := json.Unmarshal(body, &out); err == nil && out.Content != "" {
-		return out.Content, nil
-	}
-	return string(body), nil
-}
-*/
-
-func extractPDFText(ctx context.Context, localPath string) (string, error) {
+// extractFileText извлекает текст из PDF, DOCX или текстовых файлов средствами stdlib.
+func extractFileText(ctx context.Context, localPath string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	script := fmt.Sprintf(`import sys,fitz; doc=fitz.open(%q); print("".join(p.get_text() for p in doc), end="", flush=True)`, localPath)
-	cmd := exec.CommandContext(ctx, "python", "-c", script)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
+
+	data, err := os.ReadFile(localPath)
 	if err != nil {
-		return "", fmt.Errorf("pymupdf: %v (stderr: %s)", err, stderr.Bytes())
+		return "", err
 	}
-	return stdout.String(), nil
+
+	// DOCX — ZIP-архив с XML внутри
+	if isDOCX(data) {
+		text, err := extractDOCXText(data)
+		if err == nil && strings.TrimSpace(text) != "" {
+			return text, nil
+		}
+	}
+
+	// PDF — ищем текстовые строки в content streams
+	if isPDF(data) {
+		text, err := extractPDFText(data)
+		if err == nil && strings.TrimSpace(text) != "" {
+			return text, nil
+		}
+	}
+
+	// Пробуем как plain text (UTF-8 или Windows-1251)
+	if text := tryPlainText(data); text != "" {
+		return text, nil
+	}
+
+	return "", fmt.Errorf("не удалось извлечь текст (формат не распознан или бинарный файл)")
 }
 
-// tzAnalysisValues — структурированный результат анализа ТЗ (просим у Kimi строгий JSON).
+func isDOCX(data []byte) bool {
+	return len(data) > 4 && data[0] == 'P' && data[1] == 'K' && data[2] == 0x03 && data[3] == 0x04
+}
+
+func isPDF(data []byte) bool {
+	return len(data) > 5 && string(data[:5]) == "%PDF-"
+}
+
+func extractDOCXText(data []byte) (string, error) {
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", err
+	}
+	var docXML []byte
+	for _, f := range r.File {
+		if f.Name == "word/document.xml" {
+			rc, err := f.Open()
+			if err != nil {
+				return "", err
+			}
+			docXML, err = io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				return "", err
+			}
+			break
+		}
+	}
+	if docXML == nil {
+		return "", fmt.Errorf("document.xml не найден")
+	}
+	// Извлекаем текст из <w:t> элементов через простой XML decoder
+	decoder := xml.NewDecoder(bytes.NewReader(docXML))
+	var texts []string
+	var inWT bool
+	for {
+		tok, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+		switch se := tok.(type) {
+		case xml.StartElement:
+			if se.Name.Local == "t" {
+				inWT = true
+			}
+		case xml.EndElement:
+			if se.Name.Local == "t" {
+				inWT = false
+			}
+		case xml.CharData:
+			if inWT {
+				texts = append(texts, string(se))
+			}
+		}
+	}
+	return strings.Join(texts, ""), nil
+}
+
+func extractPDFText(data []byte) (string, error) {
+	// Простая эвристика: ищем текстовые литералы (text) в content streams.
+	// Для многих тендерных PDF этого достаточно.
+	re := regexp.MustCompile(`\(([^()\n\r]{2,500})\)`)
+	matches := re.FindAllStringSubmatch(string(data), -1)
+	var texts []string
+	seen := make(map[string]bool)
+	for _, m := range matches {
+		t := strings.TrimSpace(m[1])
+		if t == "" || seen[t] {
+			continue
+		}
+		// Фильтруем бинарный мусор: требуем хотя бы 30% букв
+		if textRatio(t) < 0.3 {
+			continue
+		}
+		seen[t] = true
+		texts = append(texts, t)
+	}
+	return strings.Join(texts, " "), nil
+}
+
+func textRatio(s string) float64 {
+	if len(s) == 0 {
+		return 0
+	}
+	letters := 0
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я') || r == 'ё' || r == 'Ё' {
+			letters++
+		}
+	}
+	return float64(letters) / float64(len([]rune(s)))
+}
+
+func tryPlainText(data []byte) string {
+	// Пробуем UTF-8
+	if utf8.Valid(data) {
+		return string(data)
+	}
+	// Пробуем Windows-1251 → UTF-8 (простая таблица для русских букв)
+	decoded := decodeWindows1251(data)
+	if utf8.ValidString(decoded) {
+		return decoded
+	}
+	return ""
+}
+
+func decodeWindows1251(data []byte) string {
+	var b strings.Builder
+	for _, c := range data {
+		switch {
+		case c < 0x80:
+			b.WriteByte(c)
+		case c >= 0xC0 && c <= 0xEF:
+			// А-п + а-п в Unicode
+			r := rune(0x0410 + int(c) - 0xC0)
+			b.WriteRune(r)
+		case c >= 0xF0 && c <= 0xFF:
+			// р-я + Ё
+			if c == 0xF1 {
+				b.WriteRune('ё')
+			} else {
+				r := rune(0x0440 + int(c) - 0xF0)
+				b.WriteRune(r)
+			}
+		case c == 0xA8:
+			b.WriteRune('Ё')
+		case c == 0xB8:
+			b.WriteRune('ё')
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+
+
+// tzAnalysisValues — структурированный результат анализа ТЗ (просим у LLM строгий JSON).
 type tzAnalysisValues struct {
 	Obem    string `json:"obem"`
 	Otval   string `json:"otval"`
@@ -2275,9 +2352,9 @@ type tzAnalysisValues struct {
 	Komment string `json:"komment"`
 }
 
-// kimiAnalyzeTZ прогоняет текст ТЗ через Kimi: system = содержимое ТЗ, user = инструкция
+// llmAnalyzeTZ прогоняет текст ТЗ через LLM: system = содержимое ТЗ, user = инструкция
 // извлечь 4 пункта и вернуть JSON. Возвращает извлечённые значения + полный текст ответа.
-func kimiAnalyzeTZ(ctx context.Context, tzText string) (tzAnalysisValues, string, error) {
+func llmAnalyzeTZ(ctx context.Context, tzText string) (tzAnalysisValues, string, error) {
 	var vals tzAnalysisValues
 	const maxSystemRunes = 120000 // защита от переполнения контекста на очень больших ТЗ
 	if r := []rune(tzText); len(r) > maxSystemRunes {
@@ -2299,12 +2376,10 @@ func kimiAnalyzeTZ(ctx context.Context, tzText string) (tzAnalysisValues, string
 			{"role": "system", "content": tzText},
 			{"role": "user", "content": prompt},
 		},
-		// reasoning-модель съедает токены на «размышления» — нужен запас (см. kimiSummarize);
-		// temperature НЕ передаём: kimi-k2.6 принимает только temperature=1.
 		"max_tokens": 4096,
 	})
 	req, _ := http.NewRequestWithContext(ctx, "POST", llmAPI, bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+kimiKey)
+	req.Header.Set("Authorization", "Bearer "+minimaxKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := llmClient.Do(req)
 	if err != nil {
@@ -2322,14 +2397,14 @@ func kimiAnalyzeTZ(ctx context.Context, tzText string) (tzAnalysisValues, string
 		return vals, "", err
 	}
 	if len(out.Choices) == 0 || out.Choices[0].Message.Content == "" {
-		return vals, "", fmt.Errorf("kimi: empty response")
+		return vals, "", fmt.Errorf("llm: empty response")
 	}
 	full := strings.TrimSpace(out.Choices[0].Message.Content)
 	// парсим JSON из ответа (модель может обернуть его в ```json ... ```);
 	// при ошибке парсинга полный текст всё равно уйдёт в поле «Анализ ТЗ».
 	if i, j := strings.Index(full, "{"), strings.LastIndex(full, "}"); i >= 0 && j > i {
 		if err := json.Unmarshal([]byte(full[i:j+1]), &vals); err != nil {
-			log.Printf("[анализ] не удалось распарсить JSON из ответа Kimi: %v — пишем весь текст в «Анализ ТЗ»", err)
+			log.Printf("[анализ] не удалось распарсить JSON из ответа LLM: %v — пишем весь текст в «Анализ ТЗ»", err)
 		}
 	}
 	return vals, full, nil
@@ -2477,7 +2552,7 @@ func (h *server) handleRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// Полный цикл долгий (Kimi по каждому тендеру): HTTP-запрос отвалится раньше.
+	// Полный цикл долгий (LLM по каждому тендеру): HTTP-запрос отвалится раньше.
 	// Запускаем в фоне с собственным контекстом — отключение клиента не убивает работу.
 	if !monitorRunMu.TryLock() {
 		writeJSON(w, 409, map[string]string{"status": "already_running"})
@@ -2625,8 +2700,8 @@ func main() {
 	if tenderplanKey == "" {
 		log.Println("[warn] TENDERPLAN_KEY is empty")
 	}
-	if kimiKey == "" {
-		log.Println("[warn] LLM API key is empty — set KIMI_KEY or MINIMAX_API_KEY")
+	if minimaxKey == "" {
+		log.Println("[warn] LLM API key is empty — set MINIMAX_KEY")
 	}
 	if larkAppSecret == "" {
 		log.Println("[warn] LARK_APP_SECRET is empty")
