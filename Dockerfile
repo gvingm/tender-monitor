@@ -5,8 +5,8 @@ FROM golang:1.22-alpine AS build
 WORKDIR /src
 
 # Кэшируем слой с зависимостями
-COPY go.mod ./
-RUN go mod download || true
+COPY go.mod go.sum ./
+RUN go mod download
 
 COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/tender-monitor .
