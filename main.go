@@ -22,7 +22,6 @@ import (
 	"io"
 	"log"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -2677,24 +2676,6 @@ type server struct{}
 
 // init устанавливает глобальный DNS-резолвер ДО запуска любого кода.
 // DNS-обход: встроенный DNS Docker swarm мёртв (iptables выключен на dockerd),
-// поэтому резолвим напрямую через внешние DNS по UDP.
-func init() {
-	net.DefaultResolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			// 77.88.8.8 — DNS Яндекса (быстрый в РФ), 8.8.8.8 — запасной
-			for _, srv := range []string{"77.88.8.8:53", "8.8.8.8:53"} {
-				conn, err := d.DialContext(ctx, "udp", srv)
-				if err == nil {
-					return conn, nil
-				}
-			}
-			return d.DialContext(ctx, "udp", "77.88.8.8:53")
-		},
-	}
-}
-
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	if tenderplanKey == "" {
