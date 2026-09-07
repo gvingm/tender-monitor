@@ -179,12 +179,20 @@ func getTenantToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+	var raw json.RawMessage
 	var out struct {
 		TenantAccessToken string `json:"tenant_access_token"`
 		Expire            int    `json:"expire"`
+		Code              int    `json:"code"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return "", err
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("lark token parse: %v (body: %.100s)", err, string(raw))
+	}
+	if out.Code != 0 {
+		return "", fmt.Errorf("lark token error: code=%d (body: %.100s)", out.Code, string(raw))
 	}
 	if out.TenantAccessToken == "" {
 		return "", fmt.Errorf("lark: пустой tenant_access_token")
