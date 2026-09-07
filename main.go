@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,10 +35,9 @@ import (
 // ===== CONFIG =====
 
 const (
-	tenderplanAPI       = "https://tenderplan.ru/api"
-	kimiAPI             = "https://api.moonshot.ai/v1/chat/completions"
-	kimiFilesAPI        = "https://api.moonshot.ai/v1/files" // Kimi Files API (загрузка ТЗ для анализа)
-	kimiModel           = "kimi-k2.6"
+	tenderplanAPI   = "https://tenderplan.ru/api"
+	llmAPI         = "https://api.minimax.io/v1/chat/completions"
+	llmModel       = "MiniMax-M3"
 	listenAddr          = "0.0.0.0:8787" // IPv4 явно: WSL localhostForwarding не пробрасывает tcp6-only сокеты
 	dailyRunHour        = 8
 	dailyRunMinute      = 0
@@ -140,9 +140,9 @@ var fileClient = &http.Client{
 	},
 }
 
-// kimiClient — отдельный клиент с длинным таймаутом: kimi-k2.6 — reasoning-модель,
+// llmClient — отдельный клиент с длинным таймаутом: reasoning-модель,
 // генерация с «размышлениями» может занимать 60-120 секунд.
-var kimiClient = &http.Client{
+var llmClient = &http.Client{
 	Timeout: 180 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:        10,
@@ -413,14 +413,14 @@ func kimiSummarize(ctx context.Context, t Tender) (string, error) {
 	// temperature НЕ передаём: kimi-k2.6 принимает только temperature=1,
 	// другое значение → HTTP 400 invalid_request_error.
 	body, _ := json.Marshal(map[string]any{
-		"model":      kimiModel,
+		"model":      llmModel,
 		"messages":   []map[string]string{{"role": "user", "content": prompt}},
 		"max_tokens": 4096,
 	})
-	req, _ := http.NewRequestWithContext(ctx, "POST", kimiAPI, bytes.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, "POST", llmAPI, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+kimiKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := kimiClient.Do(req)
+	resp, err := llmClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -2132,28 +2132,23 @@ func runTZAnalysis(ctx context.Context, rec bitableRecord, local []dlFile) error
 		return fmt.Errorf("файлы ТЗ не скачаны — анализ отложен")
 	}
 
-	// извлекаем текст первого файла, с которым справилась Kimi
+	// извлекаем текст первого PDF-файла локально через pymupdf
 	var tzText, usedFile string
 	for _, f := range local {
-		fileID, err := kimiUploadFile(ctx, f.path, f.name)
+		content, err := extractPDFText(ctx, f.path)
 		if err != nil {
-			log.Printf("[анализ] %s: загрузка %s в Kimi: %v", number, f.name, err)
-			continue
-		}
-		content, err := kimiFileContent(ctx, fileID)
-		if err != nil {
-			log.Printf("[анализ] %s: контент %s из Kimi: %v", number, f.name, err)
+			log.Printf("[анализ] %s: pymupdf %s: %v", number, f.name, err)
 			continue
 		}
 		if strings.TrimSpace(content) == "" {
-			log.Printf("[анализ] %s: %s — Kimi вернула пустой текст, пробуем следующий файл", number, f.name)
+			log.Printf("[анализ] %s: %s — пустой текст, пробуем следующий файл", number, f.name)
 			continue
 		}
 		tzText, usedFile = content, f.name
 		break
 	}
 	if tzText == "" {
-		return fmt.Errorf("Kimi не смогла извлечь текст ни из одного файла ТЗ")
+		return fmt.Errorf("не удалось извлечь текст ни из одного файла ТЗ")
 	}
 	log.Printf("[анализ] %s: текст ТЗ извлечён из %q (%d знаков), запускаем Kimi-анализ", number, usedFile, len([]rune(tzText)))
 
@@ -2168,7 +2163,7 @@ func runTZAnalysis(ctx context.Context, rec bitableRecord, local []dlFile) error
 	return nil
 }
 
-// kimiUploadFile загружает файл в Kimi Files API (multipart, purpose=file-extract) и возвращает file id.
+/*
 func kimiUploadFile(ctx context.Context, localPath, fileName string) (string, error) {
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
@@ -2202,7 +2197,7 @@ func kimiUploadFile(ctx context.Context, localPath, fileName string) (string, er
 	req, _ := http.NewRequestWithContext(ctx, "POST", kimiFilesAPI, pr)
 	req.Header.Set("Authorization", "Bearer "+kimiKey)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	resp, err := kimiClient.Do(req)
+	resp, err := llmClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -2226,11 +2221,10 @@ func kimiUploadFile(ctx context.Context, localPath, fileName string) (string, er
 	return out.ID, nil
 }
 
-// kimiFileContent возвращает извлечённый текст файла (GET /v1/files/{id}/content).
 func kimiFileContent(ctx context.Context, fileID string) (string, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", kimiFilesAPI+"/"+fileID+"/content", nil)
 	req.Header.Set("Authorization", "Bearer "+kimiKey)
-	resp, err := kimiClient.Do(req)
+	resp, err := llmClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -2239,7 +2233,6 @@ func kimiFileContent(ctx context.Context, fileID string) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("kimi file content HTTP %d: %.200s", resp.StatusCode, string(body))
 	}
-	// обычно ответ — JSON {"content": "...", ...}; на всякий случай принимаем и сырой текст
 	var out struct {
 		Content string `json:"content"`
 	}
@@ -2247,6 +2240,22 @@ func kimiFileContent(ctx context.Context, fileID string) (string, error) {
 		return out.Content, nil
 	}
 	return string(body), nil
+}
+*/
+
+func extractPDFText(ctx context.Context, localPath string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	script := fmt.Sprintf(`import sys,fitz; doc=fitz.open(%q); print("".join(p.get_text() for p in doc), end="", flush=True)`, localPath)
+	cmd := exec.CommandContext(ctx, "python", "-c", script)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("pymupdf: %v (stderr: %s)", err, stderr.Bytes())
+	}
+	return stdout.String(), nil
 }
 
 // tzAnalysisValues — структурированный результат анализа ТЗ (просим у Kimi строгий JSON).
@@ -2277,7 +2286,7 @@ func kimiAnalyzeTZ(ctx context.Context, tzText string) (tzAnalysisValues, string
 Ответ краткий, по-русски, структурированный. Ответь СТРОГО одним JSON-объектом без пояснений и markdown:
 {"obem":"...","otval":"...","tehnika":"...","cena_m3":"...","komment":"..."}`
 	body, _ := json.Marshal(map[string]any{
-		"model": kimiModel,
+		"model": llmModel,
 		"messages": []map[string]string{
 			{"role": "system", "content": tzText},
 			{"role": "user", "content": prompt},
@@ -2286,10 +2295,10 @@ func kimiAnalyzeTZ(ctx context.Context, tzText string) (tzAnalysisValues, string
 		// temperature НЕ передаём: kimi-k2.6 принимает только temperature=1.
 		"max_tokens": 4096,
 	})
-	req, _ := http.NewRequestWithContext(ctx, "POST", kimiAPI, bytes.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, "POST", llmAPI, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+kimiKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := kimiClient.Do(req)
+	resp, err := llmClient.Do(req)
 	if err != nil {
 		return vals, "", err
 	}
@@ -2609,7 +2618,7 @@ func main() {
 		log.Println("[warn] TENDERPLAN_KEY is empty")
 	}
 	if kimiKey == "" {
-		log.Println("[warn] KIMI_KEY is empty")
+		log.Println("[warn] LLM API key is empty — set KIMI_KEY or MINIMAX_API_KEY")
 	}
 	if larkAppSecret == "" {
 		log.Println("[warn] LARK_APP_SECRET is empty")
