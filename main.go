@@ -970,7 +970,7 @@ func downloadAttachment(ctx context.Context, att tpAttachment) (string, int64, e
 			time.Sleep(delay)
 		}
 	}
-	if status == http.StatusOK || status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
+	if status != 0 {
 		log.Printf("[files] direct %q -> HTTP %d (%v), пробуем прокси /api/tenders/file", att.RealName, status, err)
 		proxyURL := tenderplanAPI + "/tenders/file?href=" + url.QueryEscape(att.Href)
 		_, path, size, err = downloadToTemp(ctx, proxyURL, true)
