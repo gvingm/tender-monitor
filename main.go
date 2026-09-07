@@ -1348,8 +1348,9 @@ func putRecord(ctx context.Context, recordID string, fields map[string]any) erro
 // Если поле ФайлыЗагружены отсутствует — fallback: Статус + пустое поле «Файлы».
 func findRecordsForFiles(ctx context.Context) ([]bitableRecord, error) {
 	fields := []string{"Номер", "Статус", "TenderplanID", "Файлы", "ФайлыЗагружены"}
+	// Временно: ищем все записи с ФайлыЗагружены=false (без фильтра по статусу),
+	// чтобы перескачать файлы для тендеров, у которых удалили архивы.
 	recs, err := bitableSearch(ctx, []map[string]any{
-		{"field_name": "Статус", "operator": "is", "value": []string{"На рассмотрении"}},
 		{"field_name": "ФайлыЗагружены", "operator": "is", "value": []string{"false"}},
 	}, fields)
 	if err == nil {
@@ -1361,7 +1362,6 @@ func findRecordsForFiles(ctx context.Context) ([]bitableRecord, error) {
 	}
 	log.Printf("[files] поле ФайлыЗагружены отсутствует (%s), fallback на пустое поле «Файлы»", le.Msg)
 	return bitableSearch(ctx, []map[string]any{
-		{"field_name": "Статус", "operator": "is", "value": []string{"На рассмотрении"}},
 		{"field_name": "Файлы", "operator": "isEmpty", "value": []string{}},
 	}, []string{"Номер", "Статус", "TenderplanID", "Файлы"})
 }
