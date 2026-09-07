@@ -1620,6 +1620,40 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 			continue
 		}
 		res.FilesDownloaded++
+
+		// архивы распаковываем и грузим содержимое по отдельности
+		if isArchive(name) {
+			extracted, tmpDir, err := extractArchive(ctx, path, name)
+			os.Remove(path) // оригинальный архив удаляем в любом случае
+			if err != nil {
+				failed++
+				failedNames = append(failedNames, name)
+				res.FilesFailed++
+				res.Errors = append(res.Errors, fmt.Sprintf("%s: %s extract: %v", number, name, err))
+				log.Printf("[files] %s: %s — ошибка распаковки: %v", number, name, err)
+				continue
+			}
+			log.Printf("[files] %s: %s — распаковано %d файлов", number, name, len(extracted))
+			for _, ef := range extracted {
+				token, err := uploadFileToDrive(ctx, ef.path, ef.name, ef.size)
+				if err != nil {
+					failed++
+					failedNames = append(failedNames, ef.name)
+					res.FilesFailed++
+					res.Errors = append(res.Errors, fmt.Sprintf("%s: %s upload: %v", number, ef.name, err))
+					log.Printf("[files] %s: %s (%d bytes) — ошибка загрузки в Lark: %v", number, ef.name, ef.size, err)
+					continue
+				}
+				res.FilesUploaded++
+				tokens = append(tokens, token)
+				newFiles = append(newFiles, fileLink{name: ef.name, token: token})
+				log.Printf("[files] %s: %s (%d bytes) — загружен, file_token=%s", number, ef.name, ef.size, token)
+				os.Remove(ef.path)
+			}
+			os.RemoveAll(tmpDir)
+			continue
+		}
+
 		token, err := uploadFileToDrive(ctx, path, name, size)
 		if err != nil {
 			os.Remove(path)
