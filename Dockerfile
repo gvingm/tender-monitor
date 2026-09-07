@@ -8,7 +8,7 @@ WORKDIR /src
 COPY go.mod ./
 RUN go mod download || true
 
-COPY main.go ./
+COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/tender-monitor .
 
 # ---- Runtime stage ----
