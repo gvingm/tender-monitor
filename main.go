@@ -102,7 +102,10 @@ var moscowTZ = func() *time.Location {
 
 // funnelDocsDownloaded — значение поля «Воронка» для интересных тендеров,
 // у которых ВСЕ документы успешно скачаны и загружены в карточку.
-const funnelDocsDownloaded = "Документы скачал"
+const funnelDocsDownloaded = "файлы скачаны"
+
+// markPrepareDocs — ID метки Tenderplan «Подготовить документы».
+const markPrepareDocs = "6a3390185da3fa8c6a4d9132"
 
 // voronkaNewLabel — значение поля «Воронка» для новых тендеров текущего прогона.
 func voronkaNewLabel() string {
@@ -1223,9 +1226,72 @@ func uploadPart(ctx context.Context, token, uploadID string, seq int, block []by
 	return nil
 }
 
+// fileLink — имя файла и его Lark file_token (для поля «Ссылки на файлы»).
+type fileLink struct {
+	name  string
+	token string
+}
+
+// assignTenderplanMark назначает метку тендеру в Tenderplan.
+func assignTenderplanMark(ctx context.Context, tenderID, markID string) error {
+	payload := map[string]any{
+		"tenders": []string{tenderID},
+		"marks":   []string{markID},
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, "POST", tenderplanAPI+"/relations/marks/add", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tenderplanKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	_ = json.Unmarshal(respBody, &out)
+	if out.Code != 0 {
+		return fmt.Errorf("tenderplan marks/add code=%d msg=%s", out.Code, out.Msg)
+	}
+	return nil
+}
+
+// updateFileLinksField обновляет текстовое поле «Ссылки на файлы» списком загруженных файлов.
+func updateFileLinksField(ctx context.Context, recordID string, files []fileLink) error {
+	var sb strings.Builder
+	for i, f := range files {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("- ")
+		sb.WriteString(f.name)
+		sb.WriteString(" (token: ")
+		sb.WriteString(f.token)
+		sb.WriteString(")")
+	}
+	fields := map[string]any{"Ссылки на файлы": sb.String()}
+	err := putRecord(ctx, recordID, fields)
+	if err == nil {
+		return nil
+	}
+	var le *larkError
+	if !asLarkError(err, &le) || !isFieldNotFound(le.Code, le.Msg) {
+		return err
+	}
+	log.Printf("[files] поле «Ссылки на файлы» не найдено (%s), создаём и повторяем", le.Msg)
+	_ = ensureBitableField(ctx, "Ссылки на файлы", 1)
+	return putRecord(ctx, recordID, fields)
+}
+
 // updateRecordFiles пишет file_token'ы в поле «Файлы» и отмечает «ФайлыЗагружены»=true.
 // При markFunnelDone=true в той же атомарной PUT-записи поле «Воронка» переводится
-// в «Документы скачал» (для карточек воронки «интересные»).
+// в «файлы скачаны" (для карточек воронки «интересные»).
 // При отсутствии полей — пробует создать их и повторить; если не вышло — обновляет без спорного поля.
 func updateRecordFiles(ctx context.Context, recordID string, fileTokens []string, markFunnelDone bool) error {
 	atts := make([]map[string]string, 0, len(fileTokens))
@@ -1448,7 +1514,7 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 	// дедупликация (только воронка «интересные»): собираем имена/токены вложений,
 	// уже прикреплённых к карточке, — такие файлы не качаем заново, переиспользуем file_token.
 	// Для «На рассмотрении» — прежнее поведение: файлы уже есть → ранний выход.
-	var existingTokens []string
+	var existingFiles []fileLink
 	existingByName := map[string]string{}
 	if atts, ok := rec.Fields["Файлы"].([]any); ok && len(atts) > 0 {
 		if !analyze {
@@ -1463,13 +1529,15 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 			if tok == "" {
 				continue
 			}
-			existingTokens = append(existingTokens, tok)
 			if nm, _ := m["name"].(string); nm != "" {
 				existingByName[nm] = tok
+				existingFiles = append(existingFiles, fileLink{name: nm, token: tok})
+			} else {
+				existingFiles = append(existingFiles, fileLink{token: tok})
 			}
 		}
-		if len(existingTokens) > 0 {
-			log.Printf("[files] %s: у карточки уже %d вложений — докачаем только недостающие", number, len(existingTokens))
+		if len(existingFiles) > 0 {
+			log.Printf("[files] %s: у карточки уже %d вложений — докачаем только недостающие", number, len(existingFiles))
 		}
 	}
 	tenderID := bitableText(rec.Fields["TenderplanID"])
@@ -1492,6 +1560,14 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		res.RecordsDone++
 		if analyze {
 			log.Printf("[воронки] %s: документы скачаны (вложений нет), воронка → «%s»", number, funnelDocsDownloaded)
+			if err := assignTenderplanMark(ctx, tenderID, markPrepareDocs); err != nil {
+				log.Printf("[marks] %s: ошибка назначения метки «Подготовить документы»: %v", number, err)
+			} else {
+				log.Printf("[marks] %s: метка «Подготовить документы» назначена", number)
+			}
+			if err := updateFileLinksField(ctx, rec.RecordID, nil); err != nil {
+				log.Printf("[files] %s: ошибка обновления поля «Ссылки на файлы»: %v", number, err)
+			}
 		}
 		if needAnalysis {
 			// вложений нет — зафиксируем это в поле «Анализ ТЗ», чтобы не возвращаться
@@ -1512,7 +1588,8 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		}
 	}
 
-	var tokens []string // новые токены (загруженные в этом проходе)
+	var tokens []string    // новые токены (загруженные в этом проходе)
+	var newFiles []fileLink // новые файлы с именами (для поля «Ссылки на файлы»)
 	var kept []dlFile
 	failed := 0 // неудачные файлы этой записи (скачивание или загрузка в Lark)
 	var failedNames []string
@@ -1555,6 +1632,7 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		}
 		res.FilesUploaded++
 		tokens = append(tokens, token)
+		newFiles = append(newFiles, fileLink{name: name, token: token})
 		log.Printf("[files] %s: %s (%d bytes) — загружен, file_token=%s", number, name, size, token)
 		if needAnalysis && candHrefs[att.Href] && size <= maxAnalysisFileSize {
 			kept = append(kept, dlFile{att: att, path: path, name: name, size: size})
@@ -1573,22 +1651,39 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 		return
 	}
 	// мерж: уже прикреплённые + новые токены (PUT заменяет поле «Файлы» целиком)
-	tokens = append(existingTokens, tokens...)
-	if len(tokens) == 0 {
+	var allFiles []fileLink
+	allFiles = append(allFiles, existingFiles...)
+	allFiles = append(allFiles, newFiles...)
+	if len(tokens) == 0 && len(existingFiles) == 0 {
 		return // все файлы упали — карточку не трогаем, повторим в следующем проходе
 	}
-	if err := updateRecordFiles(ctx, rec.RecordID, tokens, analyze && failed == 0); err != nil {
+	fileTokens := make([]string, 0, len(existingFiles)+len(tokens))
+	for _, f := range existingFiles {
+		fileTokens = append(fileTokens, f.token)
+	}
+	fileTokens = append(fileTokens, tokens...)
+	if err := updateRecordFiles(ctx, rec.RecordID, fileTokens, analyze && failed == 0); err != nil {
 		res.Errors = append(res.Errors, number+": update record "+err.Error())
 		return
 	}
 	res.RecordsDone++
 	if reused > 0 {
-		log.Printf("[files] %s: карточка обновлена, файлов: %d (из них переиспользовано уже прикреплённых: %d)", number, len(tokens), reused)
+		log.Printf("[files] %s: карточка обновлена, файлов: %d (из них переиспользовано уже прикреплённых: %d)", number, len(fileTokens), reused)
 	} else {
-		log.Printf("[files] %s: карточка обновлена, файлов: %d", number, len(tokens))
+		log.Printf("[files] %s: карточка обновлена, файлов: %d", number, len(fileTokens))
 	}
 	if analyze {
 		log.Printf("[воронки] %s: документы скачаны, воронка → «%s»", number, funnelDocsDownloaded)
+		if err := assignTenderplanMark(ctx, tenderID, markPrepareDocs); err != nil {
+			log.Printf("[marks] %s: ошибка назначения метки «Подготовить документы»: %v", number, err)
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: mark→«Подготовить документы»: %v", number, err))
+		} else {
+			log.Printf("[marks] %s: метка «Подготовить документы» назначена", number)
+		}
+		if err := updateFileLinksField(ctx, rec.RecordID, allFiles); err != nil {
+			log.Printf("[files] %s: ошибка обновления поля «Ссылки на файлы»: %v", number, err)
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: fileLinks: %v", number, err))
+		}
 	}
 
 	// первичный анализ ТЗ (только дноуглубительные из воронки «интересные»)
