@@ -2697,6 +2697,7 @@ func (h *server) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 var monitorRunMu sync.Mutex // защита от параллельных запусков мониторинга
+var analyzeRunMu sync.Mutex   // защита от параллельных запусков анализа ТЗ
 
 func (h *server) handleRun(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -2747,37 +2748,33 @@ func (h *server) handleAnalyzeRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	ctx := r.Context()
-	recs, err := findRecordsForAnalysis(ctx)
-	if err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+	if !analyzeRunMu.TryLock() {
+		writeJSON(w, 409, map[string]string{"status": "already_running"})
 		return
 	}
-	type result struct {
-		RecordID string `json:"record_id"`
-		Number   string `json:"number"`
-		Status   string `json:"status"`
-		Error    string `json:"error,omitempty"`
-	}
-	var results []result
-	var done, failed int
-	for _, rec := range recs {
-		number := bitableText(rec.Fields["Номер"])
-		if err := runTZAnalysis(ctx, rec, nil); err != nil {
-			log.Printf("[analyze] %s: ошибка анализа: %v", number, err)
-			results = append(results, result{RecordID: rec.RecordID, Number: number, Status: "error", Error: err.Error()})
-			failed++
-			continue
+	go func() {
+		defer analyzeRunMu.Unlock()
+		ctx := context.Background()
+		recs, err := findRecordsForAnalysis(ctx)
+		if err != nil {
+			log.Printf("[analyze] ошибка поиска записей: %v", err)
+			return
 		}
-		results = append(results, result{RecordID: rec.RecordID, Number: number, Status: "ok"})
-		done++
-	}
-	writeJSON(w, 200, map[string]any{
-		"total":   len(recs),
-		"done":    done,
-		"failed":  failed,
-		"results": results,
-	})
+		log.Printf("[analyze] старт массового анализа: %d записей", len(recs))
+		var done, failed int
+		for _, rec := range recs {
+			number := bitableText(rec.Fields["Номер"])
+			if err := runTZAnalysis(ctx, rec, nil); err != nil {
+				log.Printf("[analyze] %s: ошибка анализа: %v", number, err)
+				failed++
+				continue
+			}
+			log.Printf("[analyze] %s: анализ завершён", number)
+			done++
+		}
+		log.Printf("[analyze] done: total=%d done=%d failed=%d", len(recs), done, failed)
+	}()
+	writeJSON(w, 202, map[string]string{"status": "started", "hint": "смотрите логи контейнера: [analyze] done: ..."})
 }
 
 func (h *server) handleMailTenders(w http.ResponseWriter, r *http.Request) {

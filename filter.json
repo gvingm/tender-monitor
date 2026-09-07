@@ -1,0 +1,1 @@
+{"filter": {"conjunction": "and", "conditions": [{"field_name": "ФайлыЗагружены", "operator": "is", "value": ["true"]}]}, "page_size": 50}
