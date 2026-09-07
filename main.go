@@ -2237,6 +2237,61 @@ func markAnalysisAttempt(recordID string) bool {
 	return true
 }
 
+// getLarkFilesFromRecord извлекает файлы из поля «Файлы» записи Bitable и скачивает их во временные файлы.
+func getLarkFilesFromRecord(ctx context.Context, rec bitableRecord) ([]dlFile, error) {
+	raw, ok := rec.Fields["Файлы"]
+	if !ok {
+		return nil, nil
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, nil
+	}
+	token, err := getTenantToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []dlFile
+	for _, it := range arr {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		ft, _ := m["file_token"].(string)
+		name, _ := m["name"].(string)
+		if ft == "" || name == "" {
+			continue
+		}
+		url := fmt.Sprintf("%s/drive/v1/medias/%s/download", larkBase, ft)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 {
+			continue
+		}
+		tmp, err := os.CreateTemp("", "lark-*-"+sanitizeFileName(name))
+		if err != nil {
+			continue
+		}
+		if _, err := tmp.Write(body); err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			continue
+		}
+		tmp.Close()
+		out = append(out, dlFile{path: tmp.Name(), name: name, size: int64(len(body))})
+	}
+	return out, nil
+}
+
 // runTZAnalysis — первичный анализ ТЗ дноуглубительного тендера через LLM.
 // local — уже скачанные файлы-кандидаты (nil → выбрать и скачать самостоятельно по TenderplanID).
 // Результат пишется в поля «Анализ ТЗ», «Объём грунта», «Отвал: расстояние», «Техника», «Стоимость 1 м³».
@@ -2764,7 +2819,11 @@ func (h *server) handleAnalyzeRun(w http.ResponseWriter, r *http.Request) {
 		var done, failed int
 		for _, rec := range recs {
 			number := bitableText(rec.Fields["Номер"])
-			if err := runTZAnalysis(ctx, rec, nil); err != nil {
+			local, err := getLarkFilesFromRecord(ctx, rec)
+			if err != nil {
+				log.Printf("[analyze] %s: ошибка получения файлов из Lark: %v", number, err)
+			}
+			if err := runTZAnalysis(ctx, rec, local); err != nil {
 				log.Printf("[analyze] %s: ошибка анализа: %v", number, err)
 				failed++
 				continue
