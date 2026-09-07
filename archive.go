@@ -1,10 +1,14 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
+	"compress/bzip2"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,10 +31,11 @@ type extractedFile struct {
 
 // isArchive определяет по расширению, является ли файл архивом.
 func isArchive(name string) bool {
-	ext := strings.ToLower(filepath.Ext(name))
-	switch ext {
-	case ".zip", ".rar", ".7z":
-		return true
+	lower := strings.ToLower(name)
+	for _, ext := range []string{".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".tar.gz"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
 	}
 	return false
 }
@@ -46,6 +51,8 @@ func extractArchive(ctx context.Context, archivePath, archiveName string) ([]ext
 	var files []extractedFile
 	var totalSize int64
 	var tmpDir string
+
+	log.Printf("[archive] распаковка %s (%s)", archiveName, archivePath)
 
 	// очистка при ошибке
 	cleanup := func() {
@@ -73,8 +80,18 @@ func extractArchive(ctx context.Context, archivePath, archiveName string) ([]ext
 	case ".7z":
 		files, totalSize, extractErr = extract7z(archivePath, tmpDir)
 	default:
-		cleanup()
-		return nil, "", fmt.Errorf("неподдерживаемый формат архива: %s", ext)
+		if strings.HasSuffix(strings.ToLower(archiveName), ".tar.gz") || strings.HasSuffix(strings.ToLower(archiveName), ".tgz") {
+			files, totalSize, extractErr = extractTarGz(archivePath, tmpDir)
+		} else if ext == ".tar" {
+			files, totalSize, extractErr = extractTar(archivePath, tmpDir)
+		} else if ext == ".gz" || ext == ".tgz" {
+			files, totalSize, extractErr = extractTarGz(archivePath, tmpDir)
+		} else if ext == ".bz2" {
+			files, totalSize, extractErr = extractTarBz2(archivePath, tmpDir)
+		} else {
+			cleanup()
+			return nil, "", fmt.Errorf("неподдерживаемый формат архива: %s", ext)
+		}
 	}
 
 	if extractErr != nil {
@@ -87,6 +104,7 @@ func extractArchive(ctx context.Context, archivePath, archiveName string) ([]ext
 		return nil, "", fmt.Errorf("превышен лимит распаковки: %d > %d байт", totalSize, maxExtractTotalSize)
 	}
 
+	log.Printf("[archive] %s — распаковано %d файлов, суммарный размер %d", archiveName, len(files), totalSize)
 	return files, tmpDir, nil
 }
 
@@ -235,4 +253,81 @@ func writeToFile(r io.Reader, path string) (int64, error) {
 	}
 	defer out.Close()
 	return io.Copy(out, r)
+}
+
+// extractTar распаковывает TAR.
+func extractTar(archivePath, destDir string) ([]extractedFile, int64, error) {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("tar open: %w", err)
+	}
+	defer f.Close()
+	return extractTarReader(f, destDir)
+}
+
+// extractTarGz распаковывает TAR.GZ / TGZ.
+func extractTarGz(archivePath, destDir string) ([]extractedFile, int64, error) {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("targz open: %w", err)
+	}
+	defer f.Close()
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, 0, fmt.Errorf("targz gzip: %w", err)
+	}
+	defer gr.Close()
+	return extractTarReader(gr, destDir)
+}
+
+// extractTarBz2 распаковывает TAR.BZ2.
+func extractTarBz2(archivePath, destDir string) ([]extractedFile, int64, error) {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("tarbz2 open: %w", err)
+	}
+	defer f.Close()
+	return extractTarReader(bzip2.NewReader(f), destDir)
+}
+
+// extractTarReader — общая логика для tar, tar.gz, tar.bz2.
+func extractTarReader(r io.Reader, destDir string) ([]extractedFile, int64, error) {
+	tr := tar.NewReader(r)
+	var files []extractedFile
+	var totalSize int64
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, 0, fmt.Errorf("tar read: %w", err)
+		}
+		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+			continue
+		}
+		if len(files) >= maxExtractFiles {
+			return nil, 0, fmt.Errorf("превышен лимит файлов в архиве (%d)", maxExtractFiles)
+		}
+		if header.Size > maxExtractTotalSize {
+			return nil, 0, fmt.Errorf("файл в архиве слишком большой: %s", header.Name)
+		}
+
+		name := sanitizeFileName(filepath.Base(header.Name))
+		if name == "" || name == "." {
+			name = "file"
+		}
+		tmpPath := filepath.Join(destDir, fmt.Sprintf("%d_%s", len(files), name))
+
+		size, err := writeToFile(tr, tmpPath)
+		if err != nil {
+			return nil, 0, fmt.Errorf("tar extract %s: %w", header.Name, err)
+		}
+
+		files = append(files, extractedFile{path: tmpPath, name: name, size: size})
+		totalSize += size
+	}
+
+	return files, totalSize, nil
 }

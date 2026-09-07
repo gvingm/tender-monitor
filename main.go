@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1396,6 +1397,26 @@ func findInterestingRecords(ctx context.Context) ([]bitableRecord, error) {
 	}, []string{"Номер", "TenderplanID", "Файлы", "Воронка", "Анализ ТЗ"})
 }
 
+// findRecordsForAnalysis ищет карточки с загруженными файлами и пустым «Анализ ТЗ».
+func findRecordsForAnalysis(ctx context.Context) ([]bitableRecord, error) {
+	fields := []string{"Номер", "TenderplanID", "Файлы", "ФайлыЗагружены", "Воронка", "Анализ ТЗ"}
+	recs, err := bitableSearch(ctx, []map[string]any{
+		{"field_name": "ФайлыЗагружены", "operator": "is", "value": []string{"true"}},
+		{"field_name": "Анализ ТЗ", "operator": "isEmpty", "value": []string{}},
+	}, fields)
+	if err == nil {
+		return recs, nil
+	}
+	var le *larkError
+	if !asLarkError(err, &le) || !isFieldNotFound(le.Code, le.Msg) {
+		return nil, err
+	}
+	log.Printf("[анализ] поле Анализ ТЗ отсутствует (%s), fallback на только ФайлыЗагружены", le.Msg)
+	return bitableSearch(ctx, []map[string]any{
+		{"field_name": "ФайлыЗагружены", "operator": "is", "value": []string{"true"}},
+	}, []string{"Номер", "TenderplanID", "Файлы", "ФайлыЗагружены", "Воронка"})
+}
+
 // findInterestingDoneRecords ищет «застрявшие» карточки воронки «интересные»,
 // у которых файлы уже загружены (ФайлыЗагружены=true), но воронка не переведена.
 // Их вложения не трогаем — только догоняем перевод воронки в «Документы скачал».
@@ -1620,6 +1641,7 @@ func processRecordFiles(ctx context.Context, rec bitableRecord, tenderName strin
 			continue
 		}
 		res.FilesDownloaded++
+		log.Printf("[files] %s: %s (ext=%s) — archive check: %v", number, name, filepath.Ext(name), isArchive(name))
 
 		// архивы распаковываем и грузим содержимое по отдельности
 		if isArchive(name) {
@@ -2718,6 +2740,46 @@ func (h *server) handleFilesRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, res)
 }
 
+// handleAnalyzeRun — ручной запуск массового анализа ТЗ: POST /analyze/run.
+// Обрабатывает все карточки с ФайлыЗагружены=true и пустым «Анализ ТЗ».
+func (h *server) handleAnalyzeRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx := r.Context()
+	recs, err := findRecordsForAnalysis(ctx)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	type result struct {
+		RecordID string `json:"record_id"`
+		Number   string `json:"number"`
+		Status   string `json:"status"`
+		Error    string `json:"error,omitempty"`
+	}
+	var results []result
+	var done, failed int
+	for _, rec := range recs {
+		number := bitableText(rec.Fields["Номер"])
+		if err := runTZAnalysis(ctx, rec, nil); err != nil {
+			log.Printf("[analyze] %s: ошибка анализа: %v", number, err)
+			results = append(results, result{RecordID: rec.RecordID, Number: number, Status: "error", Error: err.Error()})
+			failed++
+			continue
+		}
+		results = append(results, result{RecordID: rec.RecordID, Number: number, Status: "ok"})
+		done++
+	}
+	writeJSON(w, 200, map[string]any{
+		"total":   len(recs),
+		"done":    done,
+		"failed":  failed,
+		"results": results,
+	})
+}
+
 func (h *server) handleMailTenders(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2848,6 +2910,7 @@ func main() {
 	mux.HandleFunc("/", h.handleRoot)
 	mux.HandleFunc("/run", h.handleRun)
 	mux.HandleFunc("/files/run", h.handleFilesRun)
+	mux.HandleFunc("/analyze/run", h.handleAnalyzeRun)
 	mux.HandleFunc("/webhook/mail-tenders", h.handleMailTenders)
 	mux.HandleFunc("/tenders", h.handleListTenders)
 	mux.HandleFunc("/report", h.handleReport)
