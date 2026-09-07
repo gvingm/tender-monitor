@@ -1,60 +1,43 @@
-// Package lz4 implements the LZ4 decompressor.
 package lz4
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 
 	lz4 "github.com/pierrec/lz4/v4"
 )
 
+//nolint:gochecknoglobals
+var lz4ReaderPool sync.Pool
+
 type readCloser struct {
 	c io.Closer
 	r *lz4.Reader
 }
 
-var (
-	//nolint:gochecknoglobals
-	lz4ReaderPool sync.Pool
-
-	errAlreadyClosed = errors.New("lz4: already closed")
-	errNeedOneReader = errors.New("lz4: need exactly one reader")
-)
-
-func (rc *readCloser) Close() error {
-	if rc.c == nil || rc.r == nil {
-		return errAlreadyClosed
+func (rc *readCloser) Close() (err error) {
+	if rc.c != nil {
+		lz4ReaderPool.Put(rc.r)
+		err = rc.c.Close()
+		rc.c, rc.r = nil, nil
 	}
 
-	if err := rc.c.Close(); err != nil {
-		return fmt.Errorf("lz4: error closing: %w", err)
-	}
-
-	lz4ReaderPool.Put(rc.r)
-	rc.c, rc.r = nil, nil
-
-	return nil
+	return
 }
 
 func (rc *readCloser) Read(p []byte) (int, error) {
 	if rc.r == nil {
-		return 0, errAlreadyClosed
+		return 0, errors.New("lz4: Read after Close")
 	}
 
-	n, err := rc.r.Read(p)
-	if err != nil && !errors.Is(err, io.EOF) {
-		err = fmt.Errorf("lz4: error reading: %w", err)
-	}
-
-	return n, err
+	return rc.r.Read(p)
 }
 
 // NewReader returns a new LZ4 io.ReadCloser.
 func NewReader(_ []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, error) {
 	if len(readers) != 1 {
-		return nil, errNeedOneReader
+		return nil, errors.New("lz4: need exactly one reader")
 	}
 
 	r, ok := lz4ReaderPool.Get().(*lz4.Reader)

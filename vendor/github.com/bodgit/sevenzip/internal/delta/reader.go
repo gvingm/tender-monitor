@@ -1,10 +1,12 @@
-// Package delta implements the Delta filter.
 package delta
 
 import (
 	"errors"
-	"fmt"
 	"io"
+)
+
+const (
+	stateSize = 256
 )
 
 type readCloser struct {
@@ -13,38 +15,23 @@ type readCloser struct {
 	delta int
 }
 
-const (
-	stateSize = 256
-)
-
-var (
-	errAlreadyClosed          = errors.New("delta: already closed")
-	errNeedOneReader          = errors.New("delta: need exactly one reader")
-	errInsufficientProperties = errors.New("delta: not enough properties")
-)
-
-func (rc *readCloser) Close() error {
-	if rc.rc == nil {
-		return errAlreadyClosed
+func (rc *readCloser) Close() (err error) {
+	if rc.rc != nil {
+		err = rc.rc.Close()
+		rc.rc = nil
 	}
 
-	if err := rc.rc.Close(); err != nil {
-		return fmt.Errorf("delta: error closing: %w", err)
-	}
-
-	rc.rc = nil
-
-	return nil
+	return
 }
 
 func (rc *readCloser) Read(p []byte) (int, error) {
 	if rc.rc == nil {
-		return 0, errAlreadyClosed
+		return 0, errors.New("delta: Read after Close")
 	}
 
 	n, err := rc.rc.Read(p)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return n, fmt.Errorf("delta: error reading: %w", err)
+	if err != nil {
+		return n, err
 	}
 
 	var (
@@ -75,11 +62,11 @@ func (rc *readCloser) Read(p []byte) (int, error) {
 // NewReader returns a new Delta io.ReadCloser.
 func NewReader(p []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, error) {
 	if len(readers) != 1 {
-		return nil, errNeedOneReader
+		return nil, errors.New("delta: need exactly one reader")
 	}
 
 	if len(p) != 1 {
-		return nil, errInsufficientProperties
+		return nil, errors.New("delta: not enough properties")
 	}
 
 	return &readCloser{

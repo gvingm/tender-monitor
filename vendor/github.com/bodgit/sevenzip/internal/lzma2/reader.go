@@ -1,9 +1,7 @@
-// Package lzma2 implements the LZMA2 decompressor.
 package lzma2
 
 import (
 	"errors"
-	"fmt"
 	"io"
 
 	"github.com/ulikunitz/xz/lzma"
@@ -14,52 +12,32 @@ type readCloser struct {
 	r io.Reader
 }
 
-var (
-	errAlreadyClosed          = errors.New("lzma2: already closed")
-	errNeedOneReader          = errors.New("lzma2: need exactly one reader")
-	errInsufficientProperties = errors.New("lzma2: not enough properties")
-	errInvalidProperties      = errors.New("lzma2: invalid properties")
-)
-
 func (rc *readCloser) Close() error {
-	if rc.c == nil || rc.r == nil {
-		return errAlreadyClosed
+	var err error
+	if rc.c != nil {
+		err = rc.c.Close()
+		rc.c, rc.r = nil, nil
 	}
 
-	if err := rc.c.Close(); err != nil {
-		return fmt.Errorf("lzma2: error closing: %w", err)
-	}
-
-	rc.c, rc.r = nil, nil
-
-	return nil
+	return err
 }
 
 func (rc *readCloser) Read(p []byte) (int, error) {
 	if rc.r == nil {
-		return 0, errAlreadyClosed
+		return 0, errors.New("lzma2: Read after Close")
 	}
 
-	n, err := rc.r.Read(p)
-	if err != nil && !errors.Is(err, io.EOF) {
-		err = fmt.Errorf("lzma2: error reading: %w", err)
-	}
-
-	return n, err
+	return rc.r.Read(p)
 }
 
 // NewReader returns a new LZMA2 io.ReadCloser.
 func NewReader(p []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, error) {
 	if len(readers) != 1 {
-		return nil, errNeedOneReader
+		return nil, errors.New("lzma2: need exactly one reader")
 	}
 
 	if len(p) != 1 {
-		return nil, errInsufficientProperties
-	}
-
-	if p[0] > 40 {
-		return nil, errInvalidProperties
+		return nil, errors.New("lzma2: not enough properties")
 	}
 
 	config := lzma.Reader2Config{
@@ -67,12 +45,12 @@ func NewReader(p []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, erro
 	}
 
 	if err := config.Verify(); err != nil {
-		return nil, fmt.Errorf("lzma2: error verifying config: %w", err)
+		return nil, err
 	}
 
 	lr, err := config.NewReader2(readers[0])
 	if err != nil {
-		return nil, fmt.Errorf("lzma2: error creating reader: %w", err)
+		return nil, err
 	}
 
 	return &readCloser{

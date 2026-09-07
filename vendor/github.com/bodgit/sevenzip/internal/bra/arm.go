@@ -19,7 +19,7 @@ func (c *arm) Convert(b []byte, encoding bool) int {
 	}
 
 	if c.ip == 0 {
-		c.ip = armAlignment
+		c.ip += armAlignment
 	}
 
 	var i int
@@ -27,15 +27,18 @@ func (c *arm) Convert(b []byte, encoding bool) int {
 	for i = 0; i < len(b) & ^(armAlignment-1); i += armAlignment {
 		v := binary.LittleEndian.Uint32(b[i:])
 
-		c.ip += armAlignment
+		c.ip += uint32(armAlignment)
 
 		if b[i+3] == 0xeb {
+			v <<= 2
+
 			if encoding {
-				v += c.ip >> 2
+				v += c.ip
 			} else {
-				v -= c.ip >> 2
+				v -= c.ip
 			}
 
+			v >>= 2
 			v &= 0x00ffffff
 			v |= 0xeb000000
 		}

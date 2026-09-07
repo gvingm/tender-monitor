@@ -20,12 +20,10 @@ func (c *sparc) Convert(b []byte, encoding bool) int {
 
 	var i int
 
-	for i = 0; i < len(b) & ^(sparcAlignment-1); i, c.ip = i+sparcAlignment, c.ip+sparcAlignment {
+	for i = 0; i < len(b) & ^(sparcAlignment-1); i += sparcAlignment {
 		v := binary.BigEndian.Uint32(b[i:])
 
 		if (b[i+0] == 0x40 && b[i+1]&0xc0 == 0) || (b[i+0] == 0x7f && b[i+1] >= 0xc0) {
-			const flag = uint32(1) << 24
-
 			v <<= 2
 
 			if encoding {
@@ -35,11 +33,13 @@ func (c *sparc) Convert(b []byte, encoding bool) int {
 			}
 
 			v &= 0x01ffffff
-			v -= flag
+			v -= uint32(1) << 24
 			v ^= 0xff000000
 			v >>= 2
 			v |= 0x40000000
 		}
+
+		c.ip += uint32(sparcAlignment)
 
 		binary.BigEndian.PutUint32(b[i:], v)
 	}

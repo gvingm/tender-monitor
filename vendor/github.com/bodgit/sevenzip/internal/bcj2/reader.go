@@ -1,32 +1,14 @@
-// Package bcj2 implements the BCJ2 filter for x86 binaries.
 package bcj2
 
 import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 
 	"github.com/bodgit/sevenzip/internal/util"
+	"github.com/hashicorp/go-multierror"
 )
-
-type readCloser struct {
-	main util.ReadCloser
-	call io.ReadCloser
-	jump io.ReadCloser
-
-	rd     util.ReadCloser
-	nrange uint
-	code   uint
-
-	sd [256 + 2]uint
-
-	previous byte
-	written  uint32
-
-	buf *bytes.Buffer
-}
 
 const (
 	numMoveBits               = 5
@@ -34,11 +16,6 @@ const (
 	bitModelTotal        uint = 1 << numbitModelTotalBits
 	numTopBits                = 24
 	topValue             uint = 1 << numTopBits
-)
-
-var (
-	errAlreadyClosed   = errors.New("bcj2: already closed")
-	errNeedFourReaders = errors.New("bcj2: need exactly four readers")
 )
 
 func isJcc(b0, b1 byte) bool {
@@ -60,10 +37,27 @@ func index(b0, b1 byte) int {
 	}
 }
 
+type readCloser struct {
+	main util.ReadCloser
+	call io.ReadCloser
+	jump io.ReadCloser
+
+	rd     util.ReadCloser
+	nrange uint
+	code   uint
+
+	sd [256 + 2]uint
+
+	previous byte
+	written  uint64
+
+	buf *bytes.Buffer
+}
+
 // NewReader returns a new BCJ2 io.ReadCloser.
 func NewReader(_ []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, error) {
 	if len(readers) != 4 {
-		return nil, errNeedFourReaders
+		return nil, errors.New("bcj2: need exactly four readers")
 	}
 
 	rc := &readCloser{
@@ -78,10 +72,6 @@ func NewReader(_ []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, erro
 
 	b := make([]byte, 5)
 	if _, err := io.ReadFull(rc.rd, b); err != nil {
-		if !errors.Is(err, io.EOF) {
-			err = fmt.Errorf("bcj2: error reading initial state: %w", err)
-		}
-
 		return nil, err
 	}
 
@@ -97,41 +87,31 @@ func NewReader(_ []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, erro
 }
 
 func (rc *readCloser) Close() error {
-	if rc.main == nil || rc.call == nil || rc.jump == nil || rc.rd == nil {
-		return errAlreadyClosed
+	var err *multierror.Error
+	if rc.main != nil {
+		err = multierror.Append(err, rc.main.Close(), rc.call.Close(), rc.jump.Close(), rc.rd.Close())
 	}
 
-	if err := errors.Join(rc.main.Close(), rc.call.Close(), rc.jump.Close(), rc.rd.Close()); err != nil {
-		return fmt.Errorf("bcj2: error closing: %w", err)
-	}
-
-	rc.main, rc.call, rc.jump, rc.rd = nil, nil, nil, nil
-
-	return nil
+	return err.ErrorOrNil()
 }
 
 func (rc *readCloser) Read(p []byte) (int, error) {
-	if rc.main == nil || rc.call == nil || rc.jump == nil || rc.rd == nil {
-		return 0, errAlreadyClosed
+	if rc.main == nil {
+		return 0, errors.New("bcj2: Read after Close")
 	}
 
 	if err := rc.read(); err != nil && !errors.Is(err, io.EOF) {
 		return 0, err
 	}
 
-	n, err := rc.buf.Read(p)
-	if err != nil && !errors.Is(err, io.EOF) {
-		err = fmt.Errorf("bcj2: error reading: %w", err)
-	}
-
-	return n, err
+	return rc.buf.Read(p)
 }
 
 func (rc *readCloser) update() error {
 	if rc.nrange < topValue {
 		b, err := rc.rd.ReadByte()
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("bcj2: error reading byte: %w", err)
+		if err != nil {
+			return err
 		}
 
 		rc.code = (rc.code << 8) | uint(b)
@@ -166,7 +146,6 @@ func (rc *readCloser) decode(i int) (bool, error) {
 	return true, nil
 }
 
-//nolint:cyclop
 func (rc *readCloser) read() error {
 	var (
 		b   byte
@@ -175,10 +154,6 @@ func (rc *readCloser) read() error {
 
 	for {
 		if b, err = rc.main.ReadByte(); err != nil {
-			if !errors.Is(err, io.EOF) {
-				err = fmt.Errorf("bcj2: error reading byte: %w", err)
-			}
-
 			return err
 		}
 
@@ -201,7 +176,6 @@ func (rc *readCloser) read() error {
 		return err
 	}
 
-	//nolint:nestif
 	if bit {
 		var r io.Reader
 		if b == 0xe8 {
@@ -212,14 +186,10 @@ func (rc *readCloser) read() error {
 
 		var dest uint32
 		if err = binary.Read(r, binary.BigEndian, &dest); err != nil {
-			if !errors.Is(err, io.EOF) {
-				err = fmt.Errorf("bcj2: error reading uint32: %w", err)
-			}
-
 			return err
 		}
 
-		dest -= rc.written + 4
+		dest -= uint32(rc.written + 4)
 		_ = binary.Write(rc.buf, binary.LittleEndian, dest)
 
 		rc.previous = byte(dest >> 24)

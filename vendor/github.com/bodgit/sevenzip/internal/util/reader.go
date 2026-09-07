@@ -1,4 +1,3 @@
-// Package util implements various utility types and interfaces.
 package util
 
 import "io"
@@ -47,7 +46,7 @@ func (rc *byteReadCloser) ReadByte() (byte, error) {
 
 	n, err := rc.Read(b[:])
 	if err != nil {
-		return 0, err //nolint:wrapcheck
+		return 0, err
 	}
 
 	if n == 0 {

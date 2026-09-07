@@ -39,6 +39,9 @@ type Decoder struct {
 
 	frame *frameDec
 
+	// Custom dictionaries.
+	dicts map[uint32]*dict
+
 	// streamWg is the waitgroup for all streams
 	streamWg sync.WaitGroup
 }
@@ -98,10 +101,12 @@ func NewReader(r io.Reader, opts ...DOption) (*Decoder, error) {
 		d.current.err = ErrDecoderNilInput
 	}
 
-	// Initialize dict map if needed.
-	if d.o.dicts == nil {
-		d.o.dicts = make(map[uint32]*dict)
+	// Transfer option dicts.
+	d.dicts = make(map[uint32]*dict, len(d.o.dicts))
+	for _, dc := range d.o.dicts {
+		d.dicts[dc.id] = dc
 	}
+	d.o.dicts = nil
 
 	// Create decoders
 	d.decoders = make(chan *blockDec, d.o.concurrent)
@@ -118,7 +123,7 @@ func NewReader(r io.Reader, opts ...DOption) (*Decoder, error) {
 }
 
 // Read bytes from the decompressed stream into p.
-// Returns the number of bytes read and any error that occurred.
+// Returns the number of bytes written and any error that occurred.
 // When the stream is done, io.EOF will be returned.
 func (d *Decoder) Read(p []byte) (int, error) {
 	var n int
@@ -233,21 +238,6 @@ func (d *Decoder) Reset(r io.Reader) error {
 	return nil
 }
 
-// ResetWithOptions will reset the decoder and apply the given options
-// for the next stream or DecodeAll operation.
-// Options are applied on top of the existing options.
-// Some options cannot be changed on reset and will return an error.
-func (d *Decoder) ResetWithOptions(r io.Reader, opts ...DOption) error {
-	d.o.resetOpt = true
-	defer func() { d.o.resetOpt = false }()
-	for _, o := range opts {
-		if err := o(&d.o); err != nil {
-			return err
-		}
-	}
-	return d.Reset(r)
-}
-
 // drainOutput will drain the output until errEndOfStream is sent.
 func (d *Decoder) drainOutput() {
 	if d.current.cancel != nil {
@@ -333,7 +323,6 @@ func (d *Decoder) DecodeAll(input, dst []byte) ([]byte, error) {
 		frame.bBuf = nil
 		if frame.history.decoders.br != nil {
 			frame.history.decoders.br.in = nil
-			frame.history.decoders.br.cursor = 0
 		}
 		d.decoders <- block
 	}()
@@ -383,9 +372,11 @@ func (d *Decoder) DecodeAll(input, dst []byte) ([]byte, error) {
 		if cap(dst) == 0 && !d.o.limitToCap {
 			// Allocate len(input) * 2 by default if nothing is provided
 			// and we didn't get frame content size.
-			size := min(
-				// Cap to 1 MB.
-				len(input)*2, 1<<20)
+			size := len(input) * 2
+			// Cap to 1 MB.
+			if size > 1<<20 {
+				size = 1 << 20
+			}
 			if uint64(size) > d.o.maxDecodedSize {
 				size = int(d.o.maxDecodedSize)
 			}
@@ -940,7 +931,7 @@ decodeStream:
 }
 
 func (d *Decoder) setDict(frame *frameDec) (err error) {
-	dict, ok := d.o.dicts[frame.DictionaryID]
+	dict, ok := d.dicts[frame.DictionaryID]
 	if ok {
 		if debugDecoder {
 			println("setting dict", frame.DictionaryID)

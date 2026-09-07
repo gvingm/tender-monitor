@@ -15,7 +15,6 @@ import (
 	"github.com/bodgit/sevenzip/internal/lz4"
 	"github.com/bodgit/sevenzip/internal/lzma"
 	"github.com/bodgit/sevenzip/internal/lzma2"
-	"github.com/bodgit/sevenzip/internal/ppmd"
 	"github.com/bodgit/sevenzip/internal/zstd"
 )
 
@@ -25,16 +24,12 @@ import (
 // one io.ReadCloser's providing the stream(s) of bytes.
 type Decompressor func([]byte, uint64, []io.ReadCloser) (io.ReadCloser, error)
 
-var (
-	//nolint:gochecknoglobals
-	decompressors sync.Map
-
-	errNeedOneReader = errors.New("copy: need exactly one reader")
-)
+//nolint:gochecknoglobals
+var decompressors sync.Map
 
 func newCopyReader(_ []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, error) {
 	if len(readers) != 1 {
-		return nil, errNeedOneReader
+		return nil, errors.New("sevenzip: need exactly one reader")
 	}
 	// just return the passed io.ReadCloser)
 	return readers[0], nil
@@ -70,17 +65,15 @@ func init() {
 	RegisterDecompressor([]byte{0x04, 0xf7, 0x11, 0x04}, Decompressor(lz4.NewReader))
 	// AES-CBC-256 & SHA-256
 	RegisterDecompressor([]byte{0x06, 0xf1, 0x07, 0x01}, Decompressor(aes7z.NewReader))
-	// ARM64
-	RegisterDecompressor([]byte{0x0a}, Decompressor(bra.NewARM64Reader))
 	// LZMA2
 	RegisterDecompressor([]byte{0x21}, Decompressor(lzma2.NewReader))
-	// PPMD
-	RegisterDecompressor([]byte{0x03, 0x04, 0x01}, Decompressor(ppmd.NewReader))
 }
 
 // RegisterDecompressor allows custom decompressors for a specified method ID.
 func RegisterDecompressor(method []byte, dcomp Decompressor) {
-	decompressors.Store(string(method), dcomp)
+	if _, dup := decompressors.LoadOrStore(string(method), dcomp); dup {
+		panic("decompressor already registered")
+	}
 }
 
 func decompressor(method []byte) Decompressor {

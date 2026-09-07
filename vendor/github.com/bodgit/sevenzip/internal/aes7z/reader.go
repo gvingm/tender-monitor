@@ -1,4 +1,3 @@
-// Package aes7z implements the 7-zip AES decryption.
 package aes7z
 
 import (
@@ -6,17 +5,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"errors"
-	"fmt"
 	"io"
 )
 
-var (
-	errAlreadyClosed          = errors.New("aes7z: already closed")
-	errNeedOneReader          = errors.New("aes7z: need exactly one reader")
-	errInsufficientProperties = errors.New("aes7z: not enough properties")
-	errNoPasswordSet          = errors.New("aes7z: no password set")
-	errUnsupportedMethod      = errors.New("aes7z: unsupported compression method")
-)
+var errProperties = errors.New("aes7z: not enough properties")
 
 type readCloser struct {
 	rc       io.ReadCloser
@@ -27,28 +19,19 @@ type readCloser struct {
 }
 
 func (rc *readCloser) Close() error {
-	if rc.rc == nil {
-		return errAlreadyClosed
+	var err error
+	if rc.rc != nil {
+		err = rc.rc.Close()
+		rc.rc = nil
 	}
 
-	if err := rc.rc.Close(); err != nil {
-		return fmt.Errorf("aes7z: error closing: %w", err)
-	}
-
-	rc.rc = nil
-
-	return nil
+	return err
 }
 
 func (rc *readCloser) Password(p string) error {
-	key, err := calculateKey(p, rc.cycles, rc.salt)
+	block, err := aes.NewCipher(calculateKey(p, rc.cycles, rc.salt))
 	if err != nil {
 		return err
-	}
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return fmt.Errorf("aes7z: error creating cipher: %w", err)
 	}
 
 	rc.cbc = cipher.NewCBCDecrypter(block, rc.iv)
@@ -58,11 +41,11 @@ func (rc *readCloser) Password(p string) error {
 
 func (rc *readCloser) Read(p []byte) (int, error) {
 	if rc.rc == nil {
-		return 0, errAlreadyClosed
+		return 0, errors.New("aes7z: Read after Close")
 	}
 
 	if rc.cbc == nil {
-		return 0, errNoPasswordSet
+		return 0, errors.New("aes7z: no password set")
 	}
 
 	var block [aes.BlockSize]byte
@@ -73,7 +56,7 @@ func (rc *readCloser) Read(p []byte) (int, error) {
 				break
 			}
 
-			return 0, fmt.Errorf("aes7z: error reading block: %w", err)
+			return 0, err
 		}
 
 		rc.cbc.CryptBlocks(block[:], block[:])
@@ -81,12 +64,7 @@ func (rc *readCloser) Read(p []byte) (int, error) {
 		_, _ = rc.buf.Write(block[:])
 	}
 
-	n, err := rc.buf.Read(p)
-	if err != nil && !errors.Is(err, io.EOF) {
-		err = fmt.Errorf("aes7z: error reading: %w", err)
-	}
-
-	return n, err
+	return rc.buf.Read(p)
 }
 
 // NewReader returns a new AES-256-CBC & SHA-256 io.ReadCloser. The Password
@@ -94,16 +72,16 @@ func (rc *readCloser) Read(p []byte) (int, error) {
 // cipher is correctly initialised.
 func NewReader(p []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, error) {
 	if len(readers) != 1 {
-		return nil, errNeedOneReader
+		return nil, errors.New("aes7z: need exactly one reader")
 	}
 
 	// Need at least two bytes initially
 	if len(p) < 2 {
-		return nil, errInsufficientProperties
+		return nil, errProperties
 	}
 
 	if p[0]&0xc0 == 0 {
-		return nil, errUnsupportedMethod
+		return nil, errors.New("aes7z: unsupported compression method")
 	}
 
 	rc := new(readCloser)
@@ -112,7 +90,7 @@ func NewReader(p []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, erro
 	iv := p[0]>>6&1 + p[1]&0x0f
 
 	if len(p) != int(2+salt+iv) {
-		return nil, errInsufficientProperties
+		return nil, errProperties
 	}
 
 	rc.salt = p[2 : 2+salt]

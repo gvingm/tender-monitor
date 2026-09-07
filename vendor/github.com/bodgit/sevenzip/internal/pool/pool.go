@@ -1,4 +1,3 @@
-// Package pool implements the reader pooling.
 package pool
 
 import (
@@ -12,8 +11,8 @@ import (
 
 // Pooler is the interface implemented by a pool.
 type Pooler interface {
-	Get(offset int64) (util.SizeReadSeekCloser, bool)
-	Put(offset int64, rc util.SizeReadSeekCloser) (bool, error)
+	Get(int64) (util.SizeReadSeekCloser, bool)
+	Put(int64, util.SizeReadSeekCloser) (bool, error)
 }
 
 // Constructor is the function prototype used to instantiate a pool.
@@ -31,7 +30,7 @@ func (noopPool) Get(_ int64) (util.SizeReadSeekCloser, bool) {
 }
 
 func (noopPool) Put(_ int64, rc util.SizeReadSeekCloser) (bool, error) {
-	return false, rc.Close() //nolint:wrapcheck
+	return false, rc.Close()
 }
 
 type pool struct {
@@ -131,7 +130,7 @@ func (p *pool) removeElement(e *list.Element, cb bool) error {
 	delete(p.items, kv.key)
 
 	if cb {
-		return kv.value.Close() //nolint:wrapcheck
+		return kv.value.Close()
 	}
 
 	return nil
