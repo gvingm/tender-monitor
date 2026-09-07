@@ -4,12 +4,11 @@ FROM golang:1.22-alpine AS build
 
 WORKDIR /src
 
-# Кэшируем слой с зависимостями
+# Vendored dependencies — no network needed during build
 COPY go.mod go.sum ./
-RUN go mod download || true
-
+COPY vendor/ ./vendor/
 COPY *.go ./
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/tender-monitor .
+RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -ldflags="-s -w" -o /out/tender-monitor .
 
 # ---- Runtime stage ----
 # distroless: ca-certificates и tzdata уже внутри — apk не нужен
